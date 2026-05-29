@@ -673,22 +673,25 @@ input {
 }
 
 .page-stage.is-text-mode {
-  cursor: default;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
-.page-stage.is-text-mode.is-text-hover {
-  cursor: text;
-}
+.text-layer { display: none; }
+.text-layer span { display: none; }
 
 .pdf-canvas {
   position: absolute;
   inset: 0;
   display: block;
+  z-index: 0;
 }
 
 .redaction-box {
   position: absolute;
   pointer-events: auto;
+  z-index: 3;
 }
 
 .selection-box {
@@ -696,7 +699,7 @@ input {
   pointer-events: none;
 }
 
-.text-selection-preview { position: absolute; z-index: 3; pointer-events: none; border-radius: 1px; background: rgba(37, 99, 235, 0.28); mix-blend-mode: multiply; }
+.text-selection-preview { position: absolute; z-index: 2; pointer-events: none; border-radius: 1px; background: rgba(37, 99, 235, 0.28); mix-blend-mode: multiply; }
 
 .redaction-box {
   border: 1px solid #111827;
@@ -707,7 +710,7 @@ input {
 .redaction-box.is-selected {
   border: 2px solid #2457d6;
   background: rgb(17 24 39 / 62%);
-  z-index: 2;
+  z-index: 4;
 }
 
 .resize-handle {
@@ -753,7 +756,7 @@ input {
   border: 2px solid #f59e0b;
   background: rgb(245 158 11 / 24%);
   pointer-events: none;
-  z-index: 3;
+  z-index: 2;
 }
 
 @media (max-width: 860px) {
