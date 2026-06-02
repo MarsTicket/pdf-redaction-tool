@@ -96,6 +96,29 @@ export async function snapTextRedactions({
 }
 
 
+export async function fetchTextMap({
+  fileId,
+  page,
+  excludeDotLeader = true,
+  excludePageNumber = true,
+}) {
+  const response = await fetch(`${API_BASE_URL}/redactions/text-map`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      fileId,
+      page,
+      excludeDotLeader,
+      excludePageNumber,
+    }),
+  });
+
+  return parseJsonResponse(response);
+}
+
+
 export function toDownloadUrl(downloadUrl) {
   if (!downloadUrl) {
     return "";

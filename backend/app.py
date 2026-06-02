@@ -108,6 +108,28 @@ class SnapTextResponse(BaseModel):
     matchedWordCount: int
 
 
+class TextMapRequest(BaseModel):
+    fileId: str
+    page: int = Field(..., ge=1)
+    excludeDotLeader: bool = True
+    excludePageNumber: bool = True
+
+
+class TextMapItem(BaseModel):
+    text: str
+    rect: RectData
+    lineIndex: int
+    charIndex: int
+    selectable: bool
+    isDotLeader: bool
+    isPageNumber: bool
+
+
+class TextMapResponse(BaseModel):
+    page: int
+    chars: list[TextMapItem]
+
+
 def _safe_pdf_path(folder: Path, file_id: str) -> Path:
     try:
         UUID(file_id)
@@ -376,6 +398,86 @@ def _get_selected_char_runs(
     return runs, excluded_dot_leader_count
 
 
+def _get_page_text_map_items(
+    page: fitz.Page,
+    *,
+    exclude_dot_leader: bool,
+    exclude_page_number: bool,
+) -> list[TextMapItem]:
+    raw = page.get_text("rawdict")
+    items: list[dict] = []
+    line_index = 0
+
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            line_items: list[dict] = []
+            char_index = 0
+            for span in line.get("spans", []):
+                for char in span.get("chars", []):
+                    text = str(char.get("c") or "")
+                    bbox = char.get("bbox")
+                    if not text or not bbox or not text.strip():
+                        char_index += 1
+                        continue
+
+                    rect = fitz.Rect(bbox)
+                    line_items.append(
+                        {
+                            "text": text,
+                            "rect": rect,
+                            "lineIndex": line_index,
+                            "charIndex": char_index,
+                            "isDotLeader": _is_dot_leader_char(text),
+                            "isPageNumber": False,
+                        }
+                    )
+                    char_index += 1
+
+            number_run: list[dict] = []
+
+            def close_number_run() -> None:
+                if not number_run:
+                    return
+                run_text = "".join(item["text"] for item in number_run)
+                run_rect = _make_rect_from_char_rects([item["rect"] for item in number_run])
+                if _is_page_number_word(run_text, page.rect.width, run_rect):
+                    for item in number_run:
+                        item["isPageNumber"] = True
+                number_run.clear()
+
+            for item in line_items:
+                if item["isDotLeader"]:
+                    close_number_run()
+                    continue
+                if PAGE_NUMBER_PATTERN.fullmatch(item["text"]):
+                    number_run.append(item)
+                else:
+                    close_number_run()
+            close_number_run()
+
+            items.extend(line_items)
+            line_index += 1
+
+    mapped: list[TextMapItem] = []
+    for item in items:
+        is_dot_leader = bool(item["isDotLeader"])
+        is_page_number = bool(item["isPageNumber"])
+        selectable = not (exclude_dot_leader and is_dot_leader) and not (exclude_page_number and is_page_number)
+        mapped.append(
+            TextMapItem(
+                text=item["text"],
+                rect=_fitz_rect_to_pdf_rect(page, item["rect"]),
+                lineIndex=int(item["lineIndex"]),
+                charIndex=int(item["charIndex"]),
+                selectable=selectable,
+                isDotLeader=is_dot_leader,
+                isPageNumber=is_page_number,
+            )
+        )
+
+    return mapped
+
+
 def _read_pdf_metadata(pdf_bytes: bytes) -> tuple[int, list[PageInfo]]:
     try:
         document = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -420,6 +522,35 @@ async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
     )
 
     return UploadResponse(fileId=file_id, pageCount=page_count, pages=pages)
+
+
+@app.post("/redactions/text-map", response_model=TextMapResponse)
+async def text_map(payload: TextMapRequest) -> TextMapResponse:
+    source_path = _safe_pdf_path(UPLOAD_DIR, payload.fileId)
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail="Uploaded PDF not found")
+
+    try:
+        document = fitz.open(str(source_path))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Unable to open uploaded PDF") from exc
+
+    try:
+        page_index = payload.page - 1
+        if page_index < 0 or page_index >= document.page_count:
+            raise HTTPException(status_code=400, detail=f"Invalid page: {payload.page}")
+
+        page = document[page_index]
+        return TextMapResponse(
+            page=payload.page,
+            chars=_get_page_text_map_items(
+                page,
+                exclude_dot_leader=payload.excludeDotLeader,
+                exclude_page_number=payload.excludePageNumber,
+            ),
+        )
+    finally:
+        document.close()
 
 
 @app.post("/redactions/snap-text", response_model=SnapTextResponse)

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import * as pdfjsLib from "pdfjs-dist";
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 
-import { applyRedactions, snapTextRedactions, toDownloadUrl, uploadPdf } from "./api.js";
+import { applyRedactions, fetchTextMap, snapTextRedactions, toDownloadUrl, uploadPdf } from "./api.js";
 import {
   normalizeRect,
   pdfRectToViewportRect,
@@ -668,6 +668,107 @@ function getAnchorTextSelectionRect(anchor, current) {
     y0: rect.y0 - 8,
     y1: rect.y1 + 8,
   };
+}
+
+
+function getViewportRectIntersectionArea(rectA, rectB) {
+  const x0 = Math.max(rectA.x0, rectB.x0);
+  const y0 = Math.max(rectA.y0, rectB.y0);
+  const x1 = Math.min(rectA.x1, rectB.x1);
+  const y1 = Math.min(rectA.y1, rectB.y1);
+
+  return Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+}
+
+
+function isViewportGlyphSelected(selectionRect, glyphRect) {
+  const glyphSize = rectSize(glyphRect);
+  if (glyphSize.width <= 0 || glyphSize.height <= 0) {
+    return false;
+  }
+
+  const centerX = (glyphRect.x0 + glyphRect.x1) / 2;
+  const centerY = (glyphRect.y0 + glyphRect.y1) / 2;
+  const centerInside = centerX >= selectionRect.x0
+    && centerX <= selectionRect.x1
+    && centerY >= selectionRect.y0
+    && centerY <= selectionRect.y1;
+  if (centerInside) {
+    return true;
+  }
+
+  const overlapArea = getViewportRectIntersectionArea(selectionRect, glyphRect);
+  const glyphArea = glyphSize.width * glyphSize.height;
+  return glyphArea > 0 && (overlapArea / glyphArea) >= 0.25;
+}
+
+
+function unionRects(rects) {
+  return normalizeRect({
+    x0: Math.min(...rects.map((rect) => rect.x0)),
+    y0: Math.min(...rects.map((rect) => rect.y0)),
+    x1: Math.max(...rects.map((rect) => rect.x1)),
+    y1: Math.max(...rects.map((rect) => rect.y1)),
+  });
+}
+
+
+function shouldSplitTextGlyphRun(previousGlyph, currentGlyph) {
+  if (previousGlyph.lineIndex !== currentGlyph.lineIndex) {
+    return true;
+  }
+
+  const previousRect = previousGlyph.viewportRect;
+  const currentRect = currentGlyph.viewportRect;
+  const previousHeight = rectSize(previousRect).height;
+  const currentHeight = rectSize(currentRect).height;
+  const centerDistance = Math.abs(
+    ((previousRect.y0 + previousRect.y1) / 2) - ((currentRect.y0 + currentRect.y1) / 2),
+  );
+  if (centerDistance > Math.max(previousHeight, currentHeight) * 0.7) {
+    return true;
+  }
+
+  const gap = currentRect.x0 - previousRect.x1;
+  const maxGap = Math.max(4, Math.max(previousHeight, currentHeight) * 0.8);
+  return gap > maxGap;
+}
+
+
+function getSelectedTextGlyphRuns(viewportGlyphs, selectionRect) {
+  const selectedGlyphs = viewportGlyphs
+    .filter((glyph) => glyph.selectable && isViewportGlyphSelected(selectionRect, glyph.viewportRect))
+    .sort((a, b) => (
+      a.lineIndex - b.lineIndex
+      || a.viewportRect.x0 - b.viewportRect.x0
+      || a.charIndex - b.charIndex
+    ));
+  const runs = [];
+  let current = [];
+
+  const closeRun = () => {
+    if (current.length === 0) {
+      return;
+    }
+
+    runs.push({
+      text: current.map((glyph) => glyph.text).join(""),
+      viewportRect: unionRects(current.map((glyph) => glyph.viewportRect)),
+      pdfRect: roundRect(unionRects(current.map((glyph) => glyph.rect))),
+    });
+    current = [];
+  };
+
+  for (const glyph of selectedGlyphs) {
+    const previous = current[current.length - 1];
+    if (previous && shouldSplitTextGlyphRun(previous, glyph)) {
+      closeRun();
+    }
+    current.push(glyph);
+  }
+
+  closeRun();
+  return runs;
 }
 
 
@@ -1873,6 +1974,8 @@ const PdfPage = React.memo(function PdfPage({
   const [drag, setDrag] = useState(null);
   const [editDrag, setEditDrag] = useState(null);
   const [textSelectionPreviewRects, setTextSelectionPreviewRects] = useState([]);
+  const [textGlyphMap, setTextGlyphMap] = useState([]);
+  const [isTextGlyphMapLoaded, setIsTextGlyphMapLoaded] = useState(false);
   const [textLayerVisualDebugRects, setTextLayerVisualDebugRects] = useState([]);
   const [nativeSelectionVisualDebugRects, setNativeSelectionVisualDebugRects] = useState([]);
   const [textSelectionDisplayDebugRects, setTextSelectionDisplayDebugRects] = useState([]);
@@ -2027,6 +2130,46 @@ const PdfPage = React.memo(function PdfPage({
   }, [isNearViewport, pdfDoc, pageNumber, zoom]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    setTextGlyphMap([]);
+    setIsTextGlyphMapLoaded(false);
+
+    if (!isNearViewport || !fileId) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    async function loadTextMap() {
+      try {
+        const payload = await fetchTextMap({
+          fileId,
+          page: pageNumber,
+          excludeDotLeader: true,
+          excludePageNumber: true,
+        });
+
+        if (!cancelled) {
+          setTextGlyphMap(Array.isArray(payload?.chars) ? payload.chars : []);
+          setIsTextGlyphMapLoaded(true);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setTextGlyphMap([]);
+          setIsTextGlyphMapLoaded(false);
+        }
+      }
+    }
+
+    loadTextMap();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId, isNearViewport, pageNumber]);
+
+  useEffect(() => {
     setDrag(null);
     setTextSelectionPreviewRects([]);
     if (ENABLE_TEXT_LAYER_VISUAL_DEBUG && ENABLE_TEXT_LAYER_RECT_OVERLAY_DEBUG) {
@@ -2064,6 +2207,28 @@ const PdfPage = React.memo(function PdfPage({
   const isViewportCurrent = viewport
     && (typeof viewport.scale !== "number" || Math.abs(viewport.scale - zoom) < 0.001);
   const activeViewport = isViewportCurrent ? viewport : null;
+  const viewportTextGlyphs = useMemo(() => (
+    activeViewport
+      ? textGlyphMap
+        .map((glyph) => {
+          if (
+            !glyph?.rect
+            || !Number.isFinite(glyph.rect.x0)
+            || !Number.isFinite(glyph.rect.y0)
+            || !Number.isFinite(glyph.rect.x1)
+            || !Number.isFinite(glyph.rect.y1)
+          ) {
+            return null;
+          }
+
+          return {
+            ...glyph,
+            viewportRect: pdfRectToViewportRect(activeViewport, glyph.rect),
+          };
+        })
+        .filter(Boolean)
+      : []
+  ), [activeViewport, textGlyphMap]);
 
   const getLocalPoint = useCallback((event) => {
     const bounds = layerRef.current.getBoundingClientRect();
@@ -2180,13 +2345,11 @@ const PdfPage = React.memo(function PdfPage({
     const point = getLocalPoint(event);
     if (drag.mode === MARKING_MODE_TEXT) {
       event.preventDefault();
-      const previewRect = normalizeRect({
-        x0: drag.start.x,
-        y0: drag.start.y,
-        x1: point.x,
-        y1: point.y,
-      });
-      setTextSelectionPreviewRects([previewRect]);
+      const selectionRect = getAnchorTextSelectionRect(drag.start, point);
+      const selectedRuns = isTextGlyphMapLoaded
+        ? getSelectedTextGlyphRuns(viewportTextGlyphs, selectionRect)
+        : [];
+      setTextSelectionPreviewRects(selectedRuns.map((run) => run.viewportRect));
       setDrag((currentDrag) => (
         currentDrag
           ? {
@@ -2206,7 +2369,7 @@ const PdfPage = React.memo(function PdfPage({
           }
         : currentDrag
     ));
-  }, [activeViewport, drag, editDrag, getLocalPoint, markingMode, onBeginRedactionEdit, onUpdateRedaction]);
+  }, [activeViewport, drag, editDrag, getLocalPoint, isTextGlyphMapLoaded, markingMode, onBeginRedactionEdit, onUpdateRedaction, viewportTextGlyphs]);
 
   const finishDrag = useCallback(async (event) => {
     if (editDrag) {
@@ -2247,6 +2410,37 @@ const PdfPage = React.memo(function PdfPage({
       }
 
       const requestRect = viewportRectToPdfRect(activeViewport, selectionViewportRect);
+      const selectedRuns = isTextGlyphMapLoaded
+        ? getSelectedTextGlyphRuns(viewportTextGlyphs, selectionViewportRect)
+        : [];
+
+      if (isTextGlyphMapLoaded) {
+        const glyphRedactions = selectedRuns.map((run) => ({
+          id: makeId(),
+          page: pageNumber,
+          type: MARKING_MODE_TEXT,
+          rect: run.pdfRect,
+        }));
+
+        if (import.meta.env.DEV) {
+          console.log("[TEXT_GLYPH_SELECTION_DEBUG]", {
+            pageNumber,
+            requestRect,
+            selectedRunCount: selectedRuns.length,
+            selectedTexts: selectedRuns.map((run) => run.text),
+          });
+        }
+
+        if (glyphRedactions.length > 0) {
+          onAddRedactions(glyphRedactions);
+        }
+
+        window.getSelection()?.removeAllRanges();
+        setDrag(null);
+        setTextSelectionPreviewRects([]);
+        return;
+      }
+
       let snappedPayload = null;
 
       try {
@@ -2332,7 +2526,7 @@ const PdfPage = React.memo(function PdfPage({
 
     setDrag(null);
     setTextSelectionPreviewRects([]);
-  }, [activeViewport, drag, editDrag, fileId, getLocalPoint, onAddRedaction, onAddRedactions, pageNumber]);
+  }, [activeViewport, drag, editDrag, fileId, getLocalPoint, isTextGlyphMapLoaded, onAddRedaction, onAddRedactions, pageNumber, viewportTextGlyphs]);
 
   const visibleRedactions = useMemo(() => (
     activeViewport
