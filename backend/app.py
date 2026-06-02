@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Literal
@@ -81,6 +82,32 @@ class RedactResponse(BaseModel):
     redactionCount: int
 
 
+class SnapTextRequest(BaseModel):
+    fileId: str
+    page: int = Field(..., ge=1)
+    rect: RectData
+    mode: Literal["char", "word"] = "char"
+    expandToWord: bool = False
+    excludeDotLeader: bool = True
+    excludePageNumber: bool = True
+
+
+class SnapMatchedWord(BaseModel):
+    text: str
+    rect: RectData
+    overlapRatio: float
+
+
+class SnapTextResponse(BaseModel):
+    requestRect: RectData
+    candidateWordCount: int
+    excludedDotLeaderCount: int
+    excludedPageNumberCount: int
+    matchedWords: list[SnapMatchedWord]
+    redactions: list[RedactionItem]
+    matchedWordCount: int
+
+
 def _safe_pdf_path(folder: Path, file_id: str) -> Path:
     try:
         UUID(file_id)
@@ -120,6 +147,11 @@ def _write_json(path: Path, data: dict) -> None:
 
 AREA_TEXT_PROTECT_OVERLAP_RATIO = 0.18
 AREA_TEXT_PROTECT_GAP = 0.25
+DOT_LEADER_PATTERN = re.compile(r"^[.\u00b7\u2022\u2027\u2219\u30fb\u318d\u2026\u2027\u30fb\-_]{3,}$")
+DOT_LEADER_SEQUENCE_PATTERN = re.compile(r"[.\u00b7\u2022\u2027\u2219\u30fb\u318d\u2026\u2027\u30fb\-_]{3,}")
+PAGE_NUMBER_PATTERN = re.compile(r"^\d{1,4}$")
+DOT_LEADER_CHAR_PATTERN = re.compile(r"[.\u00b7\u318d\u2026\u2022\u2027\u2219\u30fb\-_]")
+SNAP_WORD_OVERLAP_MIN_RATIO = 0.25
 
 
 def _is_point_inside_rect(rect: fitz.Rect, x: float, y: float) -> bool:
@@ -159,6 +191,189 @@ def _protect_area_rect_from_grazed_text(page: fitz.Page, rect: fitz.Rect) -> fit
             return fitz.Rect(rect)
 
     return adjusted
+
+
+def _pdf_rect_to_fitz_query_rect(page: fitz.Page, rect: RectData) -> fitz.Rect:
+    normalized = fitz.Rect(
+        min(rect.x0, rect.x1),
+        min(rect.y0, rect.y1),
+        max(rect.x0, rect.x1),
+        max(rect.y0, rect.y1),
+    )
+    transformed = normalized * page.transformation_matrix
+    return transformed & page.rect
+
+
+def _fitz_rect_to_pdf_rect(page: fitz.Page, rect: fitz.Rect) -> RectData:
+    # Convert back to canonical PDF coordinates expected by existing frontend storage.
+    pdf_rect = rect * ~page.transformation_matrix
+    x0 = round(min(pdf_rect.x0, pdf_rect.x1), 2)
+    y0 = round(min(pdf_rect.y0, pdf_rect.y1), 2)
+    x1 = round(max(pdf_rect.x0, pdf_rect.x1), 2)
+    y1 = round(max(pdf_rect.y0, pdf_rect.y1), 2)
+    return RectData(x0=x0, y0=y0, x1=x1, y1=y1)
+
+
+def _is_dot_leader_word(text: str) -> bool:
+    normalized = (text or "").strip()
+    if len(normalized) < 3:
+        return False
+    if DOT_LEADER_PATTERN.fullmatch(normalized):
+        return True
+
+    leader_chars = DOT_LEADER_CHAR_PATTERN.findall(normalized)
+    leader_ratio = len(leader_chars) / max(1, len(normalized))
+    return leader_ratio >= 0.7
+
+
+def _has_dot_leader_sequence(text: str) -> bool:
+    return bool(DOT_LEADER_SEQUENCE_PATTERN.search((text or "").strip()))
+
+
+def _is_dot_leader_char(text: str) -> bool:
+    return bool(DOT_LEADER_CHAR_PATTERN.fullmatch(text or ""))
+
+
+def _is_page_number_word(text: str, page_width: float, word_rect: fitz.Rect) -> bool:
+    if not PAGE_NUMBER_PATTERN.fullmatch((text or "").strip()):
+        return False
+
+    # Keep numeric text in main content, but exclude far-right toc-style page numbers.
+    return word_rect.x0 >= (page_width * 0.6)
+
+
+def _get_overlap_ratio(selection_rect: fitz.Rect, target_rect: fitz.Rect) -> float:
+    intersection = target_rect & selection_rect
+    target_area = target_rect.get_area()
+    if intersection.is_empty or target_area <= 0:
+        return 0.0
+    return intersection.get_area() / target_area
+
+
+def _is_snap_candidate(selection_rect: fitz.Rect, target_rect: fitz.Rect) -> tuple[bool, float]:
+    overlap_ratio = _get_overlap_ratio(selection_rect, target_rect)
+    center_x = (target_rect.x0 + target_rect.x1) / 2
+    center_y = (target_rect.y0 + target_rect.y1) / 2
+    center_inside = _is_point_inside_rect(selection_rect, center_x, center_y)
+    return center_inside or overlap_ratio >= SNAP_WORD_OVERLAP_MIN_RATIO, overlap_ratio
+
+
+def _get_page_raw_chars(page: fitz.Page) -> list[tuple[str, fitz.Rect]]:
+    raw = page.get_text("rawdict")
+    chars: list[tuple[str, fitz.Rect]] = []
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for char in span.get("chars", []):
+                    text = str(char.get("c") or "")
+                    bbox = char.get("bbox")
+                    if not text or not bbox:
+                        continue
+                    chars.append((text, fitz.Rect(bbox)))
+    return chars
+
+
+def _make_rect_from_char_rects(char_rects: list[fitz.Rect]) -> fitz.Rect:
+    return fitz.Rect(
+        min(rect.x0 for rect in char_rects),
+        min(rect.y0 for rect in char_rects),
+        max(rect.x1 for rect in char_rects),
+        max(rect.y1 for rect in char_rects),
+    )
+
+
+def _get_non_leader_char_runs(
+    raw_chars: list[tuple[str, fitz.Rect]],
+    word_rect: fitz.Rect,
+) -> list[tuple[str, fitz.Rect]]:
+    runs: list[tuple[str, fitz.Rect]] = []
+    current_text: list[str] = []
+    current_rects: list[fitz.Rect] = []
+
+    def close_run() -> None:
+        if not current_text or not current_rects:
+            return
+        runs.append(("".join(current_text), _make_rect_from_char_rects(current_rects)))
+        current_text.clear()
+        current_rects.clear()
+
+    for char_text, char_rect in raw_chars:
+        if (char_rect & word_rect).is_empty:
+            continue
+        if not char_text.strip() or _is_dot_leader_char(char_text):
+            close_run()
+            continue
+        current_text.append(char_text)
+        current_rects.append(char_rect)
+
+    close_run()
+    return runs
+
+
+def _rect_center_y(rect: fitz.Rect) -> float:
+    return (rect.y0 + rect.y1) / 2
+
+
+def _are_chars_on_same_line(previous_rect: fitz.Rect, current_rect: fitz.Rect) -> bool:
+    previous_height = max(1.0, previous_rect.height)
+    current_height = max(1.0, current_rect.height)
+    tolerance = max(previous_height, current_height) * 0.7
+    return abs(_rect_center_y(previous_rect) - _rect_center_y(current_rect)) <= tolerance
+
+
+def _should_split_char_run(previous_rect: fitz.Rect, current_rect: fitz.Rect) -> bool:
+    if not _are_chars_on_same_line(previous_rect, current_rect):
+        return True
+
+    gap = current_rect.x0 - previous_rect.x1
+    height = max(1.0, previous_rect.height, current_rect.height)
+    return gap > max(4.0, height * 0.8)
+
+
+def _get_selected_char_runs(
+    raw_chars: list[tuple[str, fitz.Rect]],
+    selection_rect: fitz.Rect,
+) -> tuple[list[tuple[str, fitz.Rect, float]], int]:
+    runs: list[tuple[str, fitz.Rect, float]] = []
+    current_text: list[str] = []
+    current_rects: list[fitz.Rect] = []
+    current_overlaps: list[float] = []
+    excluded_dot_leader_count = 0
+
+    def close_run() -> None:
+        if not current_text or not current_rects:
+            return
+        run_text = "".join(current_text)
+        run_rect = _make_rect_from_char_rects(current_rects)
+        average_overlap = sum(current_overlaps) / max(1, len(current_overlaps))
+        runs.append((run_text, run_rect, average_overlap))
+        current_text.clear()
+        current_rects.clear()
+        current_overlaps.clear()
+
+    for char_text, char_rect in sorted(raw_chars, key=lambda item: (_rect_center_y(item[1]), item[1].x0)):
+        is_candidate, overlap_ratio = _is_snap_candidate(selection_rect, char_rect)
+        if not is_candidate:
+            continue
+
+        if not char_text.strip():
+            close_run()
+            continue
+
+        if _is_dot_leader_char(char_text):
+            close_run()
+            excluded_dot_leader_count += 1
+            continue
+
+        if current_rects and _should_split_char_run(current_rects[-1], char_rect):
+            close_run()
+
+        current_text.append(char_text)
+        current_rects.append(char_rect)
+        current_overlaps.append(overlap_ratio)
+
+    close_run()
+    return runs, excluded_dot_leader_count
 
 
 def _read_pdf_metadata(pdf_bytes: bytes) -> tuple[int, list[PageInfo]]:
@@ -205,6 +420,83 @@ async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
     )
 
     return UploadResponse(fileId=file_id, pageCount=page_count, pages=pages)
+
+
+@app.post("/redactions/snap-text", response_model=SnapTextResponse)
+async def snap_text_redactions(payload: SnapTextRequest) -> SnapTextResponse:
+    source_path = _safe_pdf_path(UPLOAD_DIR, payload.fileId)
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail="Uploaded PDF not found")
+
+    try:
+        document = fitz.open(str(source_path))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Unable to open uploaded PDF") from exc
+
+    try:
+        page_index = payload.page - 1
+        if page_index < 0 or page_index >= document.page_count:
+            raise HTTPException(status_code=400, detail=f"Invalid page: {payload.page}")
+
+        page = document[page_index]
+        selection_rect = _pdf_rect_to_fitz_query_rect(page, payload.rect)
+        request_rect_pdf = _fitz_rect_to_pdf_rect(page, selection_rect) if not selection_rect.is_empty else RectData(
+            x0=round(min(payload.rect.x0, payload.rect.x1), 2),
+            y0=round(min(payload.rect.y0, payload.rect.y1), 2),
+            x1=round(max(payload.rect.x0, payload.rect.x1), 2),
+            y1=round(max(payload.rect.y0, payload.rect.y1), 2),
+        )
+        if selection_rect.is_empty or selection_rect.get_area() <= 0:
+            return SnapTextResponse(
+                requestRect=request_rect_pdf,
+                candidateWordCount=0,
+                excludedDotLeaderCount=0,
+                excludedPageNumberCount=0,
+                matchedWords=[],
+                redactions=[],
+                matchedWordCount=0,
+            )
+
+        snapped_redactions: list[RedactionItem] = []
+        matched_words: list[SnapMatchedWord] = []
+        excluded_page_number_count = 0
+
+        raw_chars = _get_page_raw_chars(page)
+        char_runs, excluded_dot_leader_count = _get_selected_char_runs(raw_chars, selection_rect)
+        candidate_word_count = len(char_runs)
+
+        for run_text, run_rect, overlap_ratio in char_runs:
+            if payload.excludePageNumber and _is_page_number_word(run_text, page.rect.width, run_rect):
+                excluded_page_number_count += 1
+                continue
+
+            run_rect_pdf = _fitz_rect_to_pdf_rect(page, run_rect)
+            matched_words.append(
+                SnapMatchedWord(
+                    text=run_text,
+                    rect=run_rect_pdf,
+                    overlapRatio=round(overlap_ratio, 4),
+                )
+            )
+            snapped_redactions.append(
+                RedactionItem(
+                    page=payload.page,
+                    type="text",
+                    rect=run_rect_pdf,
+                )
+            )
+
+        return SnapTextResponse(
+            requestRect=request_rect_pdf,
+            candidateWordCount=candidate_word_count,
+            excludedDotLeaderCount=excluded_dot_leader_count,
+            excludedPageNumberCount=excluded_page_number_count,
+            matchedWords=matched_words,
+            redactions=snapped_redactions,
+            matchedWordCount=len(matched_words),
+        )
+    finally:
+        document.close()
 
 
 @app.post("/api/redact", response_model=RedactResponse)

@@ -674,12 +674,16 @@ input {
 
 .page-stage.is-text-mode {
   cursor: text;
-  user-select: text;
-  -webkit-user-select: text;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-.text-layer { display: none; }
-.text-layer span { display: none; }
+.page-stage.is-area-mode .text-layer { pointer-events: none; user-select: none; -webkit-user-select: none; }
+.page-stage.is-text-mode .text-layer { pointer-events: none; user-select: none; -webkit-user-select: none; }
+.text-layer { position: absolute; inset: 0; overflow: hidden; z-index: 1; line-height: 1; transform-origin: 0 0; color: transparent; text-size-adjust: none; forced-color-adjust: none; }
+.text-layer :is(span, br) { color: transparent; position: absolute; white-space: pre; cursor: text; margin: 0; transform-origin: 0 0; }
+.text-layer::selection, .text-layer :is(span, br)::selection { background: rgba(37, 99, 235, 0.28); color: transparent; }
+.page-stage.is-text-layer-content-debug .text-layer :is(span, br) { color: rgba(0, 80, 255, 0.65); background: transparent; }
 
 .pdf-canvas {
   position: absolute;
@@ -700,6 +704,16 @@ input {
 }
 
 .text-selection-preview { position: absolute; z-index: 2; pointer-events: none; border-radius: 1px; background: rgba(37, 99, 235, 0.28); mix-blend-mode: multiply; }
+.text-layer-visual-debug-overlay { position: absolute; inset: 0; z-index: 5; pointer-events: none; user-select: none; -webkit-user-select: none; }
+.text-layer-visual-debug-rect { position: absolute; box-sizing: border-box; pointer-events: none; }
+.text-layer-visual-debug-rect.is-line { border: 1px solid rgba(239, 68, 68, 0.45); background: rgba(239, 68, 68, 0.06); }
+.text-layer-visual-debug-rect.is-keyword { border: 2px solid rgba(37, 99, 235, 0.9); background: rgba(37, 99, 235, 0.14); }
+.text-layer-visual-debug-rect.is-selection { border: 2px solid rgba(22, 163, 74, 0.9); background: rgba(22, 163, 74, 0.14); }
+.text-layer-visual-debug-rect.is-display { border: 1px dashed rgba(17, 24, 39, 0.85); background: rgba(17, 24, 39, 0.08); }
+.text-layer-visual-debug-rect.is-redaction { border: 2px solid rgba(124, 58, 237, 0.9); background: rgba(124, 58, 237, 0.12); }
+.text-layer-visual-debug-label { position: absolute; left: 0; top: 0; transform: translate(0, -100%); max-width: 320px; padding: 1px 4px; border-radius: 2px; pointer-events: none; font-size: 10px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.text-layer-visual-debug-label.is-keyword { background: rgba(37, 99, 235, 0.94); color: #ffffff; }
+.text-layer-visual-debug-label.is-line { background: rgba(185, 28, 28, 0.9); color: #ffffff; }
 
 .redaction-box {
   border: 1px solid #111827;

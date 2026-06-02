@@ -67,6 +67,35 @@ export async function applyRedactions(fileId, redactions) {
 }
 
 
+export async function snapTextRedactions({
+  fileId,
+  page,
+  rect,
+  mode = "char",
+  expandToWord = false,
+  excludeDotLeader = true,
+  excludePageNumber = true,
+}) {
+  const response = await fetch(`${API_BASE_URL}/redactions/snap-text`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      fileId,
+      page,
+      rect,
+      mode,
+      expandToWord,
+      excludeDotLeader,
+      excludePageNumber,
+    }),
+  });
+
+  return parseJsonResponse(response);
+}
+
+
 export function toDownloadUrl(downloadUrl) {
   if (!downloadUrl) {
     return "";

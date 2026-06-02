@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import * as pdfjsLib from "pdfjs-dist";
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 
-import { applyRedactions, toDownloadUrl, uploadPdf } from "./api.js";
+import { applyRedactions, snapTextRedactions, toDownloadUrl, uploadPdf } from "./api.js";
 import {
   normalizeRect,
   pdfRectToViewportRect,
@@ -48,12 +48,19 @@ const TEXT_REDACTION_VERTICAL_PADDING_RATIO = 0.02;
 const TEXT_REDACTION_VERTICAL_PADDING_MIN = 0;
 const TEXT_REDACTION_VERTICAL_PADDING_MAX = 0.8;
 const TEXT_REDACTION_HORIZONTAL_PADDING_RATIO = 0.04;
-const TEXT_REDACTION_HORIZONTAL_PADDING_MIN = 0.25;
-const TEXT_REDACTION_HORIZONTAL_PADDING_MAX = 1.5;
-const TEXT_SELECTION_ANCHOR_TOLERANCE = 4;
+const TEXT_REDACTION_HORIZONTAL_PADDING_MIN = 2;
+const TEXT_REDACTION_HORIZONTAL_PADDING_MAX = 4;
+const TEXT_LAYER_SCALE_TOLERANCE = 0.001;
+const TEXT_LAYER_SIZE_TOLERANCE = 1.5;
+const TEXT_LAYER_DEBUG_KEYWORDS = ["김현희", "현희", "사법처리", "폭파사건"];
+const ENABLE_TEXT_LAYER_VISUAL_DEBUG = false;
+const ENABLE_TEXT_LAYER_RECT_OVERLAY_DEBUG = false;
+const TEXT_SELECTION_ANCHOR_TOLERANCE = 2;
 const TEXT_SELECTION_HOVER_TOLERANCE = 2;
 const TEXT_RECT_ALIGNMENT_OFFSET_X = 1;
 const TEXT_RECT_ALIGNMENT_OFFSET_Y = 1;
+const ENABLE_TEXT_X_WHITESPACE_TRIM = false;
+const ENABLE_TEXT_ITEM_TABLE_DEBUG = false;
 const TEXT = {
   appTitle: "PDF 블랙마킹",
   uploadPdf: "PDF 업로드",
@@ -389,70 +396,95 @@ function getTextItemViewportRect(viewport, item, index = 0, length = null) {
     return null;
   }
 
-  const transformed = pdfjsLib.Util.transform(viewport.transform, item.transform);
-  const viewportScale = Number(viewport.scale) || 1;
-  const itemWidth = Math.max(1, (Number(item.width) || text.length * 5) * viewportScale);
-  const transformedHeight = Math.hypot(transformed[2], transformed[3]);
-  const itemHeight = Math.max(1, (Number(item.height) || 0) * viewportScale, transformedHeight || 10);
+  const itemTransform = Array.isArray(item.transform) && item.transform.length >= 6
+    ? item.transform
+    : null;
+  if (!itemTransform) {
+    return null;
+  }
 
-
+  // item.transform is in PDF user-space. Convert through viewport APIs so
+  // the output stays in page-stage local CSS coordinates (same basis as getLocalPoint).
+  const itemWidth = Math.max(1, Number(item.width) || Math.hypot(itemTransform[0], itemTransform[1]) || text.length * 5);
+  const itemHeight = Math.max(1, Number(item.height) || Math.hypot(itemTransform[2], itemTransform[3]) || 10);
 
   const safeIndex = clamp(index, 0, text.length);
   const safeLength = clamp(length ?? text.length, 0, text.length - safeIndex);
   const startRatio = safeIndex / text.length;
   const widthRatio = safeLength / text.length;
-  const x0 = transformed[4] + (itemWidth * startRatio);
-  const y1 = transformed[5];
+  const pdfX0 = itemTransform[4] + (itemWidth * startRatio);
+  const pdfX1 = pdfX0 + Math.max(TEXT_SELECTION_MIN_SIZE, itemWidth * widthRatio);
+  const pdfY0 = itemTransform[5];
+  const pdfY1 = pdfY0 + itemHeight;
+  const viewportBounds = viewport.convertToViewportRectangle([pdfX0, pdfY0, pdfX1, pdfY1]);
+
+  if (!Array.isArray(viewportBounds) || viewportBounds.length < 4) {
+    return null;
+  }
 
   const viewportRect = normalizeRect({
-    x0: x0 + TEXT_RECT_ALIGNMENT_OFFSET_X,
-    y0: (y1 - itemHeight) + TEXT_RECT_ALIGNMENT_OFFSET_Y,
-    x1: x0 + Math.max(TEXT_SELECTION_MIN_SIZE, itemWidth * widthRatio) + TEXT_RECT_ALIGNMENT_OFFSET_X,
-    y1: y1 + 2 + TEXT_RECT_ALIGNMENT_OFFSET_Y,
+    x0: viewportBounds[0] + TEXT_RECT_ALIGNMENT_OFFSET_X,
+    y0: viewportBounds[1] + TEXT_RECT_ALIGNMENT_OFFSET_Y,
+    x1: viewportBounds[2] + TEXT_RECT_ALIGNMENT_OFFSET_X,
+    y1: viewportBounds[3] + 2 + TEXT_RECT_ALIGNMENT_OFFSET_Y,
   });
 
   return viewportRect;
 }
 
 
+function getTextItemViewportRectDebugInfo(viewport, item, index = 0, length = null) {
+  const text = item.str || "";
+  if (!text) {
+    return null;
+  }
+
+  const itemTransform = Array.isArray(item.transform) && item.transform.length >= 6
+    ? item.transform
+    : null;
+  if (!itemTransform) {
+    return null;
+  }
+
+  const itemWidth = Math.max(1, Number(item.width) || Math.hypot(itemTransform[0], itemTransform[1]) || text.length * 5);
+  const itemHeight = Math.max(1, Number(item.height) || Math.hypot(itemTransform[2], itemTransform[3]) || 10);
+  const safeIndex = clamp(index, 0, text.length);
+  const safeLength = clamp(length ?? text.length, 0, text.length - safeIndex);
+  const startRatio = safeIndex / text.length;
+  const widthRatio = safeLength / text.length;
+  const pdfX0 = itemTransform[4] + (itemWidth * startRatio);
+  const pdfX1 = pdfX0 + Math.max(TEXT_SELECTION_MIN_SIZE, itemWidth * widthRatio);
+  const pdfY0 = itemTransform[5];
+  const pdfY1 = pdfY0 + itemHeight;
+  const viewportBounds = viewport.convertToViewportRectangle([pdfX0, pdfY0, pdfX1, pdfY1]);
+  if (!Array.isArray(viewportBounds) || viewportBounds.length < 4) {
+    return null;
+  }
+
+  const convertedRectRaw = normalizeRect({
+    x0: viewportBounds[0],
+    y0: viewportBounds[1],
+    x1: viewportBounds[2],
+    y1: viewportBounds[3],
+  });
+  const itemRectFinal = normalizeRect({
+    x0: convertedRectRaw.x0 + TEXT_RECT_ALIGNMENT_OFFSET_X,
+    y0: convertedRectRaw.y0 + TEXT_RECT_ALIGNMENT_OFFSET_Y,
+    x1: convertedRectRaw.x1 + TEXT_RECT_ALIGNMENT_OFFSET_X,
+    y1: convertedRectRaw.y1 + 2 + TEXT_RECT_ALIGNMENT_OFFSET_Y,
+  });
+
+  return {
+    itemTransform,
+    itemHeight,
+    viewportScale: Number(viewport.scale) || 1,
+    convertedRectRaw,
+    itemRectFinal,
+  };
+}
+
+
 /* ── Fallback: text-item based selection (used when native textLayer alignment fails) ── */
-
-function getIntersectionArea(rectA, rectB) {
-  const x0 = Math.max(rectA.x0, rectB.x0);
-  const y0 = Math.max(rectA.y0, rectB.y0);
-  const x1 = Math.min(rectA.x1, rectB.x1);
-  const y1 = Math.min(rectA.y1, rectB.y1);
-
-  return Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
-}
-
-
-function isViewportRectSelected(selectionRect, candidateRect) {
-  const candidateSize = rectSize(candidateRect);
-  if (candidateSize.width <= 0 || candidateSize.height <= 0) {
-    return false;
-  }
-
-  const verticalOverlap = Math.min(selectionRect.y1, candidateRect.y1) - Math.max(selectionRect.y0, candidateRect.y0);
-  const horizontalOverlap = Math.min(selectionRect.x1, candidateRect.x1) - Math.max(selectionRect.x0, candidateRect.x0);
-
-  if (verticalOverlap <= 0 || horizontalOverlap <= 0) {
-    return false;
-  }
-
-  const verticalOverlapRatio = verticalOverlap / candidateSize.height;
-  const horizontalOverlapRatio = horizontalOverlap / candidateSize.width;
-
-  if (verticalOverlapRatio < 0.45) {
-    return false;
-  }
-
-  if (candidateSize.width <= 14) {
-    return horizontalOverlapRatio >= 0.18;
-  }
-
-  return horizontalOverlapRatio >= 0.35;
-}
 
 
 function expandViewportRect(rect, amount) {
@@ -465,16 +497,361 @@ function expandViewportRect(rect, amount) {
 }
 
 
+function estimateTextCharWeight(char) {
+  if (!char) {
+    return 0.6;
+  }
+
+  if (/\s/.test(char)) {
+    return 0.42;
+  }
+
+  if (/[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(char)) {
+    return 1.02;
+  }
+
+  if (/[A-Z]/.test(char)) {
+    return 0.78;
+  }
+
+  if (/[a-z]/.test(char)) {
+    return 0.68;
+  }
+
+  if (/\d/.test(char)) {
+    return 0.62;
+  }
+
+  if (/[.\u00b7\u2022\u2027\u2219\u30fbㆍ·…]/.test(char)) {
+    return 0.34;
+  }
+
+  if (/[,;:!'"`]/.test(char)) {
+    return 0.36;
+  }
+
+  if (/[()\[\]{}]/.test(char)) {
+    return 0.48;
+  }
+
+  return 0.64;
+}
+
+
+function splitTocTextItem(text) {
+  const source = text || "";
+  const leaderMatch = /[.\u00b7\u2022\u2027\u2219\u30fbㆍ·…]{3,}/.exec(source);
+  const trailingNumberMatch = /(\d{1,4})\s*$/.exec(source);
+  const leaderStartIndex = leaderMatch ? leaderMatch.index : -1;
+  const leaderEndIndex = leaderMatch ? leaderMatch.index + leaderMatch[0].length : -1;
+  const pageNumberStartIndex = trailingNumberMatch ? trailingNumberMatch.index : -1;
+  const pageNumberEndIndex = trailingNumberMatch ? trailingNumberMatch.index + trailingNumberMatch[0].length : -1;
+  const contentEndIndex = leaderStartIndex >= 0 ? leaderStartIndex : source.length;
+
+  return {
+    contentText: source.slice(0, contentEndIndex).trimEnd(),
+    contentEndIndex,
+    leaderStartIndex,
+    leaderEndIndex,
+    pageNumberStartIndex,
+    pageNumberEndIndex,
+  };
+}
+
+
+function buildTokenRects(itemRect, tokens, text) {
+  if (!itemRect || !Array.isArray(tokens) || tokens.length === 0 || !text) {
+    return {
+      tokenRects: [],
+      layout: {
+        contentText: "",
+        contentWidth: 0,
+        leaderStartIndex: -1,
+        tokenLayoutReason: "invalidInput",
+      },
+    };
+  }
+
+  const itemWidth = rectSize(itemRect).width;
+  if (itemWidth <= 0) {
+    return {
+      tokenRects: [],
+      layout: {
+        contentText: "",
+        contentWidth: 0,
+        leaderStartIndex: -1,
+        tokenLayoutReason: "invalidItemWidth",
+      },
+    };
+  }
+
+  const splitInfo = splitTocTextItem(text);
+  const cumulativeWeights = new Array(text.length + 1).fill(0);
+  for (let i = 0; i < text.length; i += 1) {
+    cumulativeWeights[i + 1] = cumulativeWeights[i] + estimateTextCharWeight(text[i]);
+  }
+
+  const totalWeight = cumulativeWeights[text.length];
+  if (totalWeight <= 0) {
+    return {
+      tokenRects: [],
+      layout: {
+        contentText: splitInfo.contentText,
+        contentWidth: 0,
+        leaderStartIndex: splitInfo.leaderStartIndex,
+        tokenLayoutReason: "invalidTotalWeight",
+      },
+    };
+  }
+
+  const contentEndIndex = clamp(splitInfo.contentEndIndex, 0, text.length);
+  const contentWeight = cumulativeWeights[contentEndIndex] - cumulativeWeights[0];
+  const hasLeader = splitInfo.leaderStartIndex >= 0;
+  const usableWeight = hasLeader ? Math.max(0, contentWeight) : totalWeight;
+  const usableWidth = hasLeader
+    ? itemWidth * (usableWeight / totalWeight)
+    : itemWidth;
+  const scale = usableWeight > 0 ? usableWidth / usableWeight : 0;
+
+  const tokenRects = tokens
+    .filter((token) => {
+      if (token.kind === "dotLeader" || token.kind === "pageNumber") {
+        return false;
+      }
+      if (hasLeader && token.startIndex >= splitInfo.leaderStartIndex) {
+        return false;
+      }
+      return true;
+    })
+    .map((token) => {
+    const safeStart = clamp(token.startIndex, 0, text.length);
+    const safeEnd = clamp(token.endIndex, safeStart, text.length);
+    const startWeight = cumulativeWeights[safeStart] - cumulativeWeights[0];
+    const endWeight = cumulativeWeights[safeEnd] - cumulativeWeights[0];
+    const tokenX0 = itemRect.x0 + (startWeight * scale);
+    const tokenX1 = itemRect.x0 + (endWeight * scale);
+
+    return {
+      ...token,
+      tokenRect: normalizeRect({
+        x0: tokenX0,
+        y0: itemRect.y0,
+        x1: Math.max(tokenX0 + TEXT_SELECTION_MIN_SIZE, tokenX1),
+        y1: itemRect.y1,
+      }),
+    };
+  });
+
+  return {
+    tokenRects,
+    layout: {
+      contentText: splitInfo.contentText,
+      contentWidth: usableWidth,
+      leaderStartIndex: splitInfo.leaderStartIndex,
+      tokenLayoutReason: hasLeader ? "contentBeforeLeader" : "fullTextNoLeader",
+    },
+  };
+}
+
+
 function getAnchorTextSelectionRect(anchor, current) {
-  return expandViewportRect(
-    normalizeRect({
-      x0: anchor.x,
-      y0: anchor.y,
-      x1: current.x,
-      y1: current.y,
-    }),
-    TEXT_SELECTION_ANCHOR_TOLERANCE,
-  );
+  const rect = normalizeRect({
+    x0: anchor.x,
+    y0: anchor.y,
+    x1: current.x,
+    y1: current.y,
+  });
+
+  return {
+    x0: rect.x0 - TEXT_SELECTION_ANCHOR_TOLERANCE,
+    x1: rect.x1 + TEXT_SELECTION_ANCHOR_TOLERANCE,
+    y0: rect.y0 - 8,
+    y1: rect.y1 + 8,
+  };
+}
+
+
+function getTextItemOverlapRange(selectionRect, itemRect, textLength, text = "", viewport = null, item = null) {
+  const logReject = () => {};
+
+  if (!textLength || textLength <= 0) {
+    logReject("invalidTextLength");
+    return null;
+  }
+
+  const itemSize = rectSize(itemRect);
+  if (itemSize.width <= 0 || itemSize.height <= 0) {
+    logReject("invalidItemSize");
+    return null;
+  }
+
+  const itemCenterY = (itemRect.y0 + itemRect.y1) / 2;
+  const selectionCenterY = (selectionRect.y0 + selectionRect.y1) / 2;
+  const centerDistance = Math.abs(selectionCenterY - itemCenterY);
+  const maxCenterDistance = itemSize.height * 0.75;
+
+  if (centerDistance > maxCenterDistance) {
+    logReject("centerDistanceTooFar", {
+      centerDistance,
+      maxCenterDistance,
+    });
+    return null;
+  }
+
+  const verticalOverlap = Math.min(selectionRect.y1, itemRect.y1) - Math.max(selectionRect.y0, itemRect.y0);
+  const horizontalOverlap = Math.min(selectionRect.x1, itemRect.x1) - Math.max(selectionRect.x0, itemRect.x0);
+
+  if (verticalOverlap <= 0) {
+    logReject("noVerticalOverlap", {
+      verticalOverlap,
+      horizontalOverlap,
+      verticalOverlapRatio: itemSize.height > 0 ? verticalOverlap / itemSize.height : null,
+    });
+    return null;
+  }
+
+  if (horizontalOverlap <= 0) {
+    logReject("noHorizontalOverlap", {
+      verticalOverlap,
+      horizontalOverlap,
+      verticalOverlapRatio: itemSize.height > 0 ? verticalOverlap / itemSize.height : null,
+    });
+    return null;
+  }
+
+  const verticalOverlapRatio = verticalOverlap / itemSize.height;
+  if (verticalOverlapRatio < 0.35) {
+    logReject("verticalRatioTooSmall", {
+      verticalOverlap,
+      horizontalOverlap,
+      verticalOverlapRatio,
+    });
+    return null;
+  }
+
+  const overlapX0 = clamp(Math.max(selectionRect.x0, itemRect.x0), itemRect.x0, itemRect.x1);
+  const overlapX1 = clamp(Math.min(selectionRect.x1, itemRect.x1), itemRect.x0, itemRect.x1);
+  let rawStartIndex = Math.floor(((overlapX0 - itemRect.x0) / itemSize.width) * textLength);
+  let rawEndIndex = Math.ceil(((overlapX1 - itemRect.x0) / itemSize.width) * textLength);
+
+  rawStartIndex = clamp(rawStartIndex, 0, textLength - 1);
+  rawEndIndex = clamp(rawEndIndex, rawStartIndex + 1, textLength);
+  const rawSegmentText = text.slice(rawStartIndex, rawEndIndex);
+
+  let adjustedStartIndex = rawStartIndex;
+  let adjustedEndIndex = rawEndIndex;
+  let adjustedSegmentText = rawSegmentText;
+  let xAdjustReason = ENABLE_TEXT_X_WHITESPACE_TRIM ? "rawIndex" : "rawIndex";
+  let tokenHitText = null;
+  let tokenHitStartIndex = null;
+  let tokenHitEndIndex = null;
+  let tokenHitOverlap = 0;
+  let tokenHitRectX0 = null;
+  let tokenHitRectX1 = null;
+  let tokenHitReason = "tokenFallbackRaw";
+  let contentText = null;
+  let contentWidth = null;
+  let leaderStartIndex = null;
+  let tokenLayoutReason = null;
+
+  if (viewport && item) {
+    const tokens = tokenizeTextItem(text);
+    const tokenLayout = buildTokenRects(itemRect, tokens, text);
+    const tokenRects = tokenLayout.tokenRects;
+    contentText = tokenLayout.layout.contentText;
+    contentWidth = tokenLayout.layout.contentWidth;
+    leaderStartIndex = tokenLayout.layout.leaderStartIndex;
+    tokenLayoutReason = tokenLayout.layout.tokenLayoutReason;
+    const tokenCandidates = [];
+
+    for (const token of tokenRects) {
+      const tokenRect = token.tokenRect;
+      if (!tokenRect) {
+        continue;
+      }
+
+      const tokenHorizontalOverlap = Math.min(selectionRect.x1, tokenRect.x1) - Math.max(selectionRect.x0, tokenRect.x0);
+      const tokenVerticalOverlap = Math.min(selectionRect.y1, tokenRect.y1) - Math.max(selectionRect.y0, tokenRect.y0);
+      if (tokenHorizontalOverlap <= 0 || tokenVerticalOverlap <= 0) {
+        continue;
+      }
+
+      const tokenCenterX = (tokenRect.x0 + tokenRect.x1) / 2;
+      const selectionCenterX = (selectionRect.x0 + selectionRect.x1) / 2;
+      tokenCandidates.push({
+        ...token,
+        tokenRect,
+        horizontalOverlap: tokenHorizontalOverlap,
+        verticalOverlap: tokenVerticalOverlap,
+        centerDistanceX: Math.abs(selectionCenterX - tokenCenterX),
+      });
+    }
+
+    if (tokenCandidates.length > 0) {
+      tokenCandidates.sort((a, b) => {
+        if (Math.abs(b.horizontalOverlap - a.horizontalOverlap) > 0.001) {
+          return b.horizontalOverlap - a.horizontalOverlap;
+        }
+        return a.centerDistanceX - b.centerDistanceX;
+      });
+
+      const maxOverlap = tokenCandidates[0].horizontalOverlap;
+      const includedTokens = tokenCandidates
+        .filter((candidate) => candidate.horizontalOverlap >= Math.max(1, maxOverlap * 0.28))
+        .sort((a, b) => a.startIndex - b.startIndex);
+
+      if (includedTokens.length > 0) {
+        const firstToken = includedTokens[0];
+        const lastToken = includedTokens[includedTokens.length - 1];
+        adjustedStartIndex = firstToken.startIndex;
+        adjustedEndIndex = lastToken.endIndex;
+        adjustedSegmentText = text.slice(adjustedStartIndex, adjustedEndIndex);
+        tokenHitText = includedTokens.map((token) => token.text).join(" ");
+        tokenHitStartIndex = adjustedStartIndex;
+        tokenHitEndIndex = adjustedEndIndex;
+        tokenHitOverlap = maxOverlap;
+        tokenHitRectX0 = Number(firstToken.tokenRect.x0.toFixed(2));
+        tokenHitRectX1 = Number(lastToken.tokenRect.x1.toFixed(2));
+        tokenHitReason = includedTokens.length > 1 ? "tokenMultiHit" : "tokenSingleHit";
+        xAdjustReason = "tokenHit";
+      }
+    }
+  }
+
+  if (
+    adjustedEndIndex <= adjustedStartIndex
+    || !adjustedSegmentText.trim()
+    || adjustedSegmentText.trim().length < 1
+  ) {
+    adjustedStartIndex = rawStartIndex;
+    adjustedEndIndex = rawEndIndex;
+    adjustedSegmentText = text.slice(adjustedStartIndex, adjustedEndIndex);
+    xAdjustReason = "fallbackToRaw";
+    tokenHitReason = "tokenFallbackRaw";
+  }
+
+  return {
+    startIndex: adjustedStartIndex,
+    endIndex: adjustedEndIndex,
+    rawStartIndex,
+    rawEndIndex,
+    adjustedStartIndex,
+    adjustedEndIndex,
+    rawSegmentText,
+    adjustedSegmentText,
+    xAdjustReason,
+    tokenHitText,
+    tokenHitStartIndex,
+    tokenHitEndIndex,
+    tokenHitOverlap,
+    tokenHitRectX0,
+    tokenHitRectX1,
+    tokenHitReason,
+    contentText,
+    contentWidth,
+    leaderStartIndex,
+    tokenLayoutReason,
+  };
 }
 
 
@@ -498,6 +875,28 @@ function getTextSegmentKind(text) {
   }
 
   return "text";
+}
+
+
+function tokenizeTextItem(text) {
+  const source = text || "";
+  const tokens = [];
+  const pattern = /[.\u00b7\u2022\u2027\u2219\u30fbㆍ·…]+|\d+|[^\s.\u00b7\u2022\u2027\u2219\u30fbㆍ·…]+/g;
+  let match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    const tokenText = match[0];
+    const startIndex = match.index;
+    const endIndex = match.index + tokenText.length;
+    tokens.push({
+      text: tokenText,
+      startIndex,
+      endIndex,
+      kind: getTextSegmentKind(tokenText),
+    });
+  }
+
+  return tokens;
 }
 
 
@@ -528,84 +927,243 @@ function makeTextSelectionSegment(viewport, item, startIndex, endIndex, itemInde
 }
 
 
-function tokenizeTextItem(text) {
-  const tokens = [];
-  const source = text || "";
-  const pattern = /[가-힣]+|[A-Za-z]+(?:[.'\u2019_-][A-Za-z]+)*|\d+(?:[.,:-]\d+)*|[.\u00b7\u2022\u2027\u2219\u30fbㆍ·…]+|\s+|./g;
-  let match;
-
-  while ((match = pattern.exec(source)) !== null) {
-    const value = match[0];
-    tokens.push({
-      text: value,
-      startIndex: match.index,
-      endIndex: match.index + value.length,
-      kind: getTextSegmentKind(value),
-      isWhitespace: !value.trim(),
-    });
-  }
-
-  return tokens;
-}
-
-
-function getTextItemTokenRects(viewport, item, itemIndex) {
-  const text = item.str || "";
-  const tokens = tokenizeTextItem(text);
-  const visibleTokens = tokens.filter((token) => !token.isWhitespace);
-
-  return visibleTokens
-    .map((token, tokenIndex) => {
-      const viewportRect = getTextItemViewportRect(
-        viewport,
-        item,
-        token.startIndex,
-        token.endIndex - token.startIndex,
-      );
-
-      if (!viewportRect) {
-        return null;
-      }
-
-      const size = rectSize(viewportRect);
-      if (size.width < TEXT_SELECTION_MIN_SIZE || size.height < TEXT_SELECTION_MIN_SIZE) {
-        return null;
-      }
-
-      return {
-        key: `${itemIndex}:${token.startIndex}:${token.endIndex}:${tokenIndex}`,
-        text: token.text,
-        kind: token.kind,
-        viewportRect,
-        centerY: getViewportRectCenterY(viewportRect),
-        height: size.height,
-        itemIndex,
-        startIndex: token.startIndex,
-        endIndex: token.endIndex,
-      };
-    })
-    .filter(Boolean);
-}
-
-
-function collectSelectedTextSegments(viewport, textItems, isTextRectSelected) {
+function collectSelectedTextSegments(viewport, textItems, selectionRect, debugContext = null) {
   const segments = [];
+  const debugRows = import.meta.env.DEV && ENABLE_TEXT_ITEM_TABLE_DEBUG ? [] : null;
+  const selectionCenterY = (selectionRect.y0 + selectionRect.y1) / 2;
 
   for (let itemIndex = 0; itemIndex < textItems.length; itemIndex += 1) {
     const item = textItems[itemIndex];
-    const tokenRects = getTextItemTokenRects(viewport, item, itemIndex);
+    const text = item.str || "";
+    const visualLineText = text.trim();
+    let itemRect = null;
+    let itemDebugInfo = null;
+    let verticalOverlapRatio = null;
+    let overlapX0 = null;
+    let overlapX1 = null;
+    let debugStartIndex = null;
+    let debugEndIndex = null;
+    let selected = false;
+    let overlapRange = null;
+    let segment = null;
+    let rejectReason = "selected";
 
-
-
-    for (const tokenRect of tokenRects) {
-      if (tokenRect.kind === "empty") {
-        continue;
+    if (!text.trim()) {
+      rejectReason = "emptyText";
+      if (debugRows) {
+        debugRows.push({
+          text,
+          itemRect: null,
+          selectionRect: `${selectionRect.x0.toFixed(2)}, ${selectionRect.y0.toFixed(2)}, ${selectionRect.x1.toFixed(2)}, ${selectionRect.y1.toFixed(2)}`,
+          verticalOverlapRatio: null,
+          overlapX0: null,
+          overlapX1: null,
+          overlapRangeExists: false,
+          overlapRangeStartIndex: null,
+          overlapRangeEndIndex: null,
+          debugStartIndex: null,
+          debugEndIndex: null,
+          segmentExists: false,
+          segmentText: null,
+          segmentKind: null,
+          startIndex: null,
+          endIndex: null,
+          selected: false,
+          rejectReason,
+        });
       }
-
-      if (isTextRectSelected(tokenRect.viewportRect)) {
-        segments.push(tokenRect);
-      }
+      continue;
     }
+
+    itemDebugInfo = getTextItemViewportRectDebugInfo(viewport, item, 0, text.length);
+    itemRect = itemDebugInfo?.itemRectFinal || null;
+    if (!itemRect) {
+      rejectReason = "noItemRect";
+      if (debugRows) {
+        debugRows.push({
+          text,
+          itemRect: null,
+          selectionRect: `${selectionRect.x0.toFixed(2)}, ${selectionRect.y0.toFixed(2)}, ${selectionRect.x1.toFixed(2)}, ${selectionRect.y1.toFixed(2)}`,
+          verticalOverlapRatio: null,
+          overlapX0: null,
+          overlapX1: null,
+          overlapRangeExists: false,
+          overlapRangeStartIndex: null,
+          overlapRangeEndIndex: null,
+          debugStartIndex: null,
+          debugEndIndex: null,
+          segmentExists: false,
+          segmentText: null,
+          segmentKind: null,
+          startIndex: null,
+          endIndex: null,
+          selected: false,
+          rejectReason,
+        });
+      }
+      continue;
+    }
+
+    const itemCenterY = (itemRect.y0 + itemRect.y1) / 2;
+    const centerDistance = Math.abs(selectionCenterY - itemCenterY);
+
+    const itemSize = rectSize(itemRect);
+    const verticalOverlap = Math.min(selectionRect.y1, itemRect.y1) - Math.max(selectionRect.y0, itemRect.y0);
+    const horizontalOverlap = Math.min(selectionRect.x1, itemRect.x1) - Math.max(selectionRect.x0, itemRect.x0);
+    verticalOverlapRatio = itemSize.height > 0 ? verticalOverlap / itemSize.height : null;
+
+    if (text.length > 0 && itemSize.width > 0 && verticalOverlap > 0 && horizontalOverlap > 0) {
+      overlapX0 = clamp(Math.max(selectionRect.x0, itemRect.x0), itemRect.x0, itemRect.x1);
+      overlapX1 = clamp(Math.min(selectionRect.x1, itemRect.x1), itemRect.x0, itemRect.x1);
+      debugStartIndex = Math.floor(((overlapX0 - itemRect.x0) / itemSize.width) * text.length);
+      debugEndIndex = Math.ceil(((overlapX1 - itemRect.x0) / itemSize.width) * text.length);
+      debugStartIndex = clamp(debugStartIndex, 0, text.length - 1);
+      debugEndIndex = clamp(debugEndIndex, debugStartIndex + 1, text.length);
+    }
+
+    overlapRange = getTextItemOverlapRange(selectionRect, itemRect, text.length, text, viewport, item);
+    if (overlapRange) {
+      segment = makeTextSelectionSegment(
+        viewport,
+        item,
+        overlapRange.startIndex,
+        overlapRange.endIndex,
+        itemIndex,
+      );
+      if (!segment) {
+        rejectReason = "noSegment";
+      } else if (segment.kind === "dotLeader" || segment.kind === "pageNumber") {
+        rejectReason = `ignoredKind:${segment.kind}`;
+      } else {
+        segments.push(segment);
+        selected = true;
+        rejectReason = "selected";
+      }
+    } else {
+      rejectReason = "noOverlapRange";
+    }
+
+    const horizontalNear = selectionRect.x1 >= (itemRect.x0 - 24) && selectionRect.x0 <= (itemRect.x1 + 24);
+    const sameLineNear = centerDistance <= (Math.max(itemSize.height, 1) * 1.5);
+    const shouldLogSelectionDecision = import.meta.env.DEV && horizontalNear && sameLineNear;
+
+    if (shouldLogSelectionDecision) {
+      console.log("[SEGMENT_DECISION_DEBUG]", {
+        text,
+        overlapRangeExists: !!overlapRange,
+        overlapRangeStartIndex: overlapRange ? overlapRange.startIndex : null,
+        overlapRangeEndIndex: overlapRange ? overlapRange.endIndex : null,
+        rawStartIndex: overlapRange ? overlapRange.rawStartIndex : null,
+        rawEndIndex: overlapRange ? overlapRange.rawEndIndex : null,
+        adjustedStartIndex: overlapRange ? overlapRange.adjustedStartIndex : null,
+        adjustedEndIndex: overlapRange ? overlapRange.adjustedEndIndex : null,
+        rawSegmentText: overlapRange ? overlapRange.rawSegmentText : null,
+        adjustedSegmentText: overlapRange ? overlapRange.adjustedSegmentText : null,
+        xAdjustReason: overlapRange ? overlapRange.xAdjustReason : null,
+        tokenHitText: overlapRange ? overlapRange.tokenHitText : null,
+        tokenHitStartIndex: overlapRange ? overlapRange.tokenHitStartIndex : null,
+        tokenHitEndIndex: overlapRange ? overlapRange.tokenHitEndIndex : null,
+        tokenHitOverlap: overlapRange ? overlapRange.tokenHitOverlap : null,
+        tokenHitRectX0: overlapRange ? overlapRange.tokenHitRectX0 : null,
+        tokenHitRectX1: overlapRange ? overlapRange.tokenHitRectX1 : null,
+        tokenHitReason: overlapRange ? overlapRange.tokenHitReason : null,
+        contentText: overlapRange ? overlapRange.contentText : null,
+        contentWidth: overlapRange ? overlapRange.contentWidth : null,
+        leaderStartIndex: overlapRange ? overlapRange.leaderStartIndex : null,
+        tokenLayoutReason: overlapRange ? overlapRange.tokenLayoutReason : null,
+        segmentExists: !!segment,
+        segmentText: segment ? segment.text : null,
+        segmentKind: segment ? segment.kind : null,
+        selected,
+        rejectReason,
+      });
+
+      const rawStartIndexForDebug = overlapRange
+        ? (Number.isFinite(overlapRange.rawStartIndex) ? overlapRange.rawStartIndex : overlapRange.startIndex)
+        : debugStartIndex;
+      const rawEndIndexForDebug = overlapRange
+        ? (Number.isFinite(overlapRange.rawEndIndex) ? overlapRange.rawEndIndex : overlapRange.endIndex)
+        : debugEndIndex;
+      const rawSegmentTextForDebug = (
+        Number.isFinite(rawStartIndexForDebug)
+        && Number.isFinite(rawEndIndexForDebug)
+        && rawEndIndexForDebug > rawStartIndexForDebug
+      )
+        ? text.slice(rawStartIndexForDebug, rawEndIndexForDebug)
+        : null;
+
+      console.log("[TEXT_X_HIT_DEBUG]", {
+        text,
+        selectionRect,
+        itemRect,
+        itemWidth: Number(item?.width) || null,
+        itemRectWidth: rectSize(itemRect).width,
+        itemTextLength: text.length,
+        horizontalOverlap,
+        overlapX0,
+        overlapX1,
+        rawStartIndex: rawStartIndexForDebug,
+        rawEndIndex: rawEndIndexForDebug,
+        rawSegmentText: rawSegmentTextForDebug,
+        tokenHitText: overlapRange ? overlapRange.tokenHitText : null,
+        tokenRectX0: overlapRange ? overlapRange.tokenHitRectX0 : null,
+        tokenRectX1: overlapRange ? overlapRange.tokenHitRectX1 : null,
+        contentText: overlapRange ? overlapRange.contentText : null,
+        contentWidth: overlapRange ? overlapRange.contentWidth : null,
+        leaderStartIndex: overlapRange ? overlapRange.leaderStartIndex : null,
+        tokenLayoutReason: overlapRange ? overlapRange.tokenLayoutReason : null,
+        rejectReason,
+        dragStart: debugContext?.dragStart ?? null,
+        dragCurrent: debugContext?.dragCurrent ?? null,
+      });
+    }
+
+    if (debugRows) {
+      debugRows.push({
+        text,
+        itemRect: `${itemRect.x0.toFixed(2)}, ${itemRect.y0.toFixed(2)}, ${itemRect.x1.toFixed(2)}, ${itemRect.y1.toFixed(2)}`,
+        selectionRect: `${selectionRect.x0.toFixed(2)}, ${selectionRect.y0.toFixed(2)}, ${selectionRect.x1.toFixed(2)}, ${selectionRect.y1.toFixed(2)}`,
+        verticalOverlapRatio: verticalOverlapRatio === null ? null : Number(verticalOverlapRatio.toFixed(4)),
+        overlapX0: overlapX0 === null ? null : Number(overlapX0.toFixed(2)),
+        overlapX1: overlapX1 === null ? null : Number(overlapX1.toFixed(2)),
+        overlapRangeExists: !!overlapRange,
+        overlapRangeStartIndex: overlapRange ? overlapRange.startIndex : null,
+        overlapRangeEndIndex: overlapRange ? overlapRange.endIndex : null,
+        rawStartIndex: overlapRange ? overlapRange.rawStartIndex : null,
+        rawEndIndex: overlapRange ? overlapRange.rawEndIndex : null,
+        adjustedStartIndex: overlapRange ? overlapRange.adjustedStartIndex : null,
+        adjustedEndIndex: overlapRange ? overlapRange.adjustedEndIndex : null,
+        rawSegmentText: overlapRange ? overlapRange.rawSegmentText : null,
+        adjustedSegmentText: overlapRange ? overlapRange.adjustedSegmentText : null,
+        xAdjustReason: overlapRange ? overlapRange.xAdjustReason : null,
+        tokenHitText: overlapRange ? overlapRange.tokenHitText : null,
+        tokenHitStartIndex: overlapRange ? overlapRange.tokenHitStartIndex : null,
+        tokenHitEndIndex: overlapRange ? overlapRange.tokenHitEndIndex : null,
+        tokenHitOverlap: overlapRange ? overlapRange.tokenHitOverlap : null,
+        tokenHitRectX0: overlapRange ? overlapRange.tokenHitRectX0 : null,
+        tokenHitRectX1: overlapRange ? overlapRange.tokenHitRectX1 : null,
+        tokenHitReason: overlapRange ? overlapRange.tokenHitReason : null,
+        contentText: overlapRange ? overlapRange.contentText : null,
+        contentWidth: overlapRange ? overlapRange.contentWidth : null,
+        leaderStartIndex: overlapRange ? overlapRange.leaderStartIndex : null,
+        tokenLayoutReason: overlapRange ? overlapRange.tokenLayoutReason : null,
+        debugStartIndex,
+        debugEndIndex,
+        segmentExists: !!segment,
+        segmentText: segment ? segment.text : null,
+        segmentKind: segment ? segment.kind : null,
+        startIndex: debugStartIndex,
+        endIndex: debugEndIndex,
+        selected,
+        rejectReason,
+      });
+    }
+  }
+
+  if (debugRows) {
+    console.groupCollapsed("[TEXT_ITEM_OVERLAP_DEBUG]");
+    console.table(debugRows);
+    console.groupEnd();
   }
 
   return segments;
@@ -783,7 +1341,7 @@ function mergeSelectedTextSegments(viewport, segments) {
 }
 
 
-function getAnchorTextSelections(viewport, textItems, anchor, current) {
+function getAnchorTextSelections(viewport, textItems, anchor, current, debugContext = null) {
   if (!viewport || !anchor || !current) {
     return [];
   }
@@ -792,7 +1350,8 @@ function getAnchorTextSelections(viewport, textItems, anchor, current) {
   const selectedSegments = collectSelectedTextSegments(
     viewport,
     textItems,
-    (charRect) => isViewportRectSelected(selectionRect, charRect),
+    selectionRect,
+    debugContext,
   );
 
   const merged = mergeSelectedTextSegments(viewport, selectedSegments);
@@ -808,6 +1367,215 @@ function getTextSelectionRedactions(viewport, textSelections, pageNumber) {
     type: MARKING_MODE_TEXT,
     rect: viewportRectToPdfRect(viewport, selection.redactionRect),
   }));
+}
+
+
+function getLocalSelectionRectsFromTextLayer(textLayerElement) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed || !textLayerElement) {
+    return [];
+  }
+
+  const bounds = textLayerElement.getBoundingClientRect();
+  if (bounds.width <= 0 || bounds.height <= 0) {
+    return [];
+  }
+
+  const rects = [];
+  for (let rangeIndex = 0; rangeIndex < selection.rangeCount; rangeIndex += 1) {
+    const range = selection.getRangeAt(rangeIndex);
+    const clientRects = Array.from(range.getClientRects());
+
+    for (const clientRect of clientRects) {
+      if (clientRect.width <= 0 || clientRect.height <= 0) {
+        continue;
+      }
+
+      if (
+        clientRect.right <= bounds.left
+        || clientRect.left >= bounds.right
+        || clientRect.bottom <= bounds.top
+        || clientRect.top >= bounds.bottom
+      ) {
+        continue;
+      }
+
+      const localRect = normalizeRect({
+        x0: clamp(clientRect.left - bounds.left, 0, bounds.width),
+        y0: clamp(clientRect.top - bounds.top, 0, bounds.height),
+        x1: clamp(clientRect.right - bounds.left, 0, bounds.width),
+        y1: clamp(clientRect.bottom - bounds.top, 0, bounds.height),
+      });
+      const size = rectSize(localRect);
+
+      if (size.width < TEXT_SELECTION_MIN_SIZE || size.height < TEXT_SELECTION_MIN_SIZE) {
+        continue;
+      }
+
+      rects.push(localRect);
+    }
+  }
+
+  return rects;
+}
+
+
+function getNativeTextSelections(viewport, textLayerElement, providedLocalRects = null) {
+  const localRects = Array.isArray(providedLocalRects)
+    ? providedLocalRects
+    : getLocalSelectionRectsFromTextLayer(textLayerElement);
+  if (localRects.length === 0) {
+    return [];
+  }
+
+  const segments = localRects.map((viewportRect, index) => {
+    const size = rectSize(viewportRect);
+
+    return {
+      key: `native:${index}`,
+      text: "",
+      kind: "text",
+      viewportRect,
+      centerY: getViewportRectCenterY(viewportRect),
+      height: size.height,
+    };
+  });
+
+  return mergeSelectedTextSegments(viewport, segments);
+}
+
+
+function getTextLayerKeywordSpanMatches(textLayerElement, keywords = TEXT_LAYER_DEBUG_KEYWORDS) {
+  if (!textLayerElement) {
+    return [];
+  }
+
+  const layerBounds = textLayerElement.getBoundingClientRect();
+  const spans = Array.from(textLayerElement.querySelectorAll("span"));
+
+  return spans
+    .map((span) => {
+      const text = span.textContent || "";
+      if (!keywords.some((keyword) => text.includes(keyword))) {
+        return null;
+      }
+
+      const rect = span.getBoundingClientRect();
+      const left = rect.left - layerBounds.left;
+      const right = rect.right - layerBounds.left;
+
+      return {
+        text,
+        left: Number(left.toFixed(2)),
+        right: Number(right.toFixed(2)),
+        width: Number(rect.width.toFixed(2)),
+      };
+    })
+    .filter(Boolean);
+}
+
+
+function getTextLayerVisualDebugRects(textLayerElement, keywords = TEXT_LAYER_DEBUG_KEYWORDS) {
+  if (!textLayerElement) {
+    return [];
+  }
+
+  const layerBounds = textLayerElement.getBoundingClientRect();
+  if (layerBounds.width <= 0 || layerBounds.height <= 0) {
+    return [];
+  }
+
+  const spans = Array.from(textLayerElement.querySelectorAll("span"));
+
+  return spans
+    .map((span, index) => {
+      const rect = span.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return null;
+      }
+
+      const text = span.textContent || "";
+      const localRect = normalizeRect({
+        x0: clamp(rect.left - layerBounds.left, 0, layerBounds.width),
+        y0: clamp(rect.top - layerBounds.top, 0, layerBounds.height),
+        x1: clamp(rect.right - layerBounds.left, 0, layerBounds.width),
+        y1: clamp(rect.bottom - layerBounds.top, 0, layerBounds.height),
+      });
+      const size = rectSize(localRect);
+      if (size.width <= 0 || size.height <= 0) {
+        return null;
+      }
+
+      const isKeyword = keywords.some((keyword) => text.includes(keyword));
+
+      return {
+        key: `${index}`,
+        kind: isKeyword ? "keyword" : "line",
+        rect: localRect,
+        text,
+      };
+    })
+    .filter(Boolean);
+}
+
+
+function isRectOnSelectionLine(rect, selectionRects) {
+  if (!Array.isArray(selectionRects) || selectionRects.length === 0) {
+    return false;
+  }
+
+  const rectCenterY = (rect.y0 + rect.y1) / 2;
+
+  return selectionRects.some((selectionRect) => {
+    const verticalOverlap = Math.min(rect.y1, selectionRect.y1) - Math.max(rect.y0, selectionRect.y0);
+    if (verticalOverlap > 0) {
+      return true;
+    }
+
+    const selectionCenterY = (selectionRect.y0 + selectionRect.y1) / 2;
+    const tolerance = Math.max(2, rectSize(rect).height * 0.45);
+    return Math.abs(rectCenterY - selectionCenterY) <= tolerance;
+  });
+}
+
+
+function logTextLayerDomDebug(textLayerElement) {
+  if (!import.meta.env.DEV || !textLayerElement) {
+    return;
+  }
+
+  const spans = Array.from(textLayerElement.querySelectorAll("span"));
+  const layerBounds = textLayerElement.getBoundingClientRect();
+  const keywords = TEXT_LAYER_DEBUG_KEYWORDS;
+
+  const toRow = (span, index) => {
+    const rect = span.getBoundingClientRect();
+    return {
+      index,
+      text: span.textContent || "",
+      left: Number((rect.left - layerBounds.left).toFixed(2)),
+      right: Number((rect.right - layerBounds.left).toFixed(2)),
+      top: Number((rect.top - layerBounds.top).toFixed(2)),
+      width: Number(rect.width.toFixed(2)),
+      height: Number(rect.height.toFixed(2)),
+      transform: span.style.transform || "",
+    };
+  };
+
+  const firstRows = spans.slice(0, 80).map((span, index) => toRow(span, index));
+  const keywordRows = spans
+    .map((span, index) => ({ span, index }))
+    .filter(({ span }) => {
+      const text = span.textContent || "";
+      return keywords.some((keyword) => text.includes(keyword));
+    })
+    .map(({ span, index }) => toRow(span, index));
+
+  console.log("[TEXT_LAYER_DOM_DEBUG]", {
+    spanCount: spans.length,
+    spans: firstRows,
+    keywordSpans: keywordRows,
+  });
 }
 
 
@@ -1080,6 +1848,7 @@ function resizeViewportRect(rect, handle, point, bounds, preserveRatio) {
 
 const PdfPage = React.memo(function PdfPage({
   pdfDoc,
+  fileId,
   pageInfo,
   pageNumber,
   zoom,
@@ -1098,17 +1867,23 @@ const PdfPage = React.memo(function PdfPage({
   const pageRef = useRef(null);
   const canvasRef = useRef(null);
   const layerRef = useRef(null);
-  const textItemsRef = useRef([]);
+  const textLayerRef = useRef(null);
+  const textLayerTaskRef = useRef(null);
   const [viewport, setViewport] = useState(null);
   const [drag, setDrag] = useState(null);
   const [editDrag, setEditDrag] = useState(null);
   const [textSelectionPreviewRects, setTextSelectionPreviewRects] = useState([]);
+  const [textLayerVisualDebugRects, setTextLayerVisualDebugRects] = useState([]);
+  const [nativeSelectionVisualDebugRects, setNativeSelectionVisualDebugRects] = useState([]);
+  const [textSelectionDisplayDebugRects, setTextSelectionDisplayDebugRects] = useState([]);
+  const [textSelectionRedactionDebugRects, setTextSelectionRedactionDebugRects] = useState([]);
   const [renderState, setRenderState] = useState("idle");
   const isNearViewport = useNearViewport(pageRef, scrollRootRef);
 
   useEffect(() => {
     let cancelled = false;
     let renderTask = null;
+    let textLayerTask = null;
     let queuedRender = null;
 
     async function renderPage() {
@@ -1156,6 +1931,66 @@ const PdfPage = React.memo(function PdfPage({
           setViewport(nextViewport);
           renderTask = page.render(renderContext);
           await renderTask.promise;
+          if (cancelled) {
+            return;
+          }
+
+          const textLayerElement = textLayerRef.current;
+          if (textLayerElement) {
+            textLayerTaskRef.current?.cancel?.();
+            textLayerTaskRef.current = null;
+            textLayerElement.innerHTML = "";
+            textLayerElement.style.width = `${nextViewport.width}px`;
+            textLayerElement.style.height = `${nextViewport.height}px`;
+            textLayerElement.style.setProperty("--scale-factor", String(nextViewport.scale));
+            textLayerElement.dataset.scale = String(nextViewport.scale);
+            textLayerElement.dataset.width = String(nextViewport.width);
+            textLayerElement.dataset.height = String(nextViewport.height);
+            textLayerElement.setAttribute("data-main-rotation", String(nextViewport.rotation));
+
+            const textLayerViewport = nextViewport.clone
+              ? nextViewport.clone({ dontFlip: true })
+              : nextViewport;
+            let cachedTextContent = null;
+            const getTextContent = async () => {
+              if (cachedTextContent) {
+                return cachedTextContent;
+              }
+
+              cachedTextContent = await page.getTextContent({
+                includeMarkedContent: true,
+                disableNormalization: true,
+              });
+
+              return cachedTextContent;
+            };
+            const textContentSource = typeof page.streamTextContent === "function"
+              ? page.streamTextContent({ includeMarkedContent: true, disableNormalization: true })
+              : await getTextContent();
+            if (cancelled) {
+              return;
+            }
+
+            if (typeof pdfjsLib.TextLayer === "function") {
+              textLayerTask = new pdfjsLib.TextLayer({
+                textContentSource,
+                container: textLayerElement,
+                viewport: textLayerViewport,
+              });
+              textLayerTaskRef.current = textLayerTask;
+              await textLayerTask.render();
+              if (cancelled) {
+                return;
+              }
+            }
+
+            if (ENABLE_TEXT_LAYER_VISUAL_DEBUG) {
+              logTextLayerDomDebug(textLayerElement);
+            }
+            if (ENABLE_TEXT_LAYER_VISUAL_DEBUG && ENABLE_TEXT_LAYER_RECT_OVERLAY_DEBUG) {
+              setTextLayerVisualDebugRects(getTextLayerVisualDebugRects(textLayerElement, TEXT_LAYER_DEBUG_KEYWORDS));
+            }
+          }
 
           if (!cancelled) {
             setRenderState("ready");
@@ -1183,46 +2018,22 @@ const PdfPage = React.memo(function PdfPage({
       if (renderTask) {
         renderTask.cancel();
       }
+      if (textLayerTask) {
+        textLayerTask.cancel();
+      }
+      textLayerTaskRef.current?.cancel?.();
+      textLayerTaskRef.current = null;
     };
   }, [isNearViewport, pdfDoc, pageNumber, zoom]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    if (!isNearViewport || markingMode !== MARKING_MODE_TEXT) {
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    async function loadTextItems() {
-      try {
-        const page = await pdfDoc.getPage(pageNumber);
-        if (cancelled) {
-          return;
-        }
-
-        const textContent = await page.getTextContent();
-        if (cancelled) {
-          return;
-        }
-
-        textItemsRef.current = textContent.items || [];
-      } catch {
-        textItemsRef.current = [];
-      }
-    }
-
-    loadTextItems();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isNearViewport, markingMode, pageNumber, pdfDoc]);
-
-  useEffect(() => {
     setDrag(null);
     setTextSelectionPreviewRects([]);
+    if (ENABLE_TEXT_LAYER_VISUAL_DEBUG && ENABLE_TEXT_LAYER_RECT_OVERLAY_DEBUG) {
+      setNativeSelectionVisualDebugRects([]);
+      setTextSelectionDisplayDebugRects([]);
+      setTextSelectionRedactionDebugRects([]);
+    }
   }, [markingMode]);
 
   const isTextDragging = drag?.mode === MARKING_MODE_TEXT;
@@ -1368,23 +2179,22 @@ const PdfPage = React.memo(function PdfPage({
 
     const point = getLocalPoint(event);
     if (drag.mode === MARKING_MODE_TEXT) {
-      const nextDrag = {
-        ...drag,
-        current: point,
-      };
-
-      const textItems = textItemsRef.current;
-      if (textItems.length > 0 && activeViewport) {
-        const textSelections = getAnchorTextSelections(
-          activeViewport,
-          textItems,
-          nextDrag.start,
-          nextDrag.current,
-        );
-        setTextSelectionPreviewRects(textSelections.map((selection) => selection.displayRect));
-      }
-
-      setDrag(nextDrag);
+      event.preventDefault();
+      const previewRect = normalizeRect({
+        x0: drag.start.x,
+        y0: drag.start.y,
+        x1: point.x,
+        y1: point.y,
+      });
+      setTextSelectionPreviewRects([previewRect]);
+      setDrag((currentDrag) => (
+        currentDrag
+          ? {
+              ...currentDrag,
+              current: point,
+            }
+          : currentDrag
+      ));
       return;
     }
 
@@ -1398,7 +2208,7 @@ const PdfPage = React.memo(function PdfPage({
     ));
   }, [activeViewport, drag, editDrag, getLocalPoint, markingMode, onBeginRedactionEdit, onUpdateRedaction]);
 
-  const finishDrag = useCallback((event) => {
+  const finishDrag = useCallback(async (event) => {
     if (editDrag) {
       setEditDrag(null);
       return;
@@ -1412,47 +2222,89 @@ const PdfPage = React.memo(function PdfPage({
 
     const current = getLocalPoint(event);
     if (drag.mode === MARKING_MODE_TEXT) {
-      const movedEnough = Math.abs(current.x - drag.start.x) >= MIN_SELECTION_SIZE
-        || Math.abs(current.y - drag.start.y) >= MIN_SELECTION_SIZE;
+      if (!fileId) {
+        setDrag(null);
+        setTextSelectionPreviewRects([]);
+        return;
+      }
 
-      if (movedEnough) {
-        const textItems = textItemsRef.current;
-        if (textItems.length > 0) {
-          const textSelections = getAnchorTextSelections(
-            activeViewport,
-            textItems,
-            drag.start,
-            current,
-          );
-          const textRedactions = getTextSelectionRedactions(
-            activeViewport,
-            textSelections,
-            pageNumber,
-          );
+      const selectionViewportRect = getAnchorTextSelectionRect(drag.start, current);
+      const selectionSize = rectSize(selectionViewportRect);
+      if (selectionSize.width < TEXT_SELECTION_MIN_SIZE || selectionSize.height < TEXT_SELECTION_MIN_SIZE) {
+        setDrag(null);
+        setTextSelectionPreviewRects([]);
+        return;
+      }
 
-          // DEV: text selection debug logging
-          if (import.meta.env.DEV) {
-            console.groupCollapsed("[TEXT_SELECTION_DEBUG]");
-            console.log("Zoom:", activeViewport.scale);
-            console.log("Start:", drag.start);
-            console.log("End:", current);
-            console.log("TextItems:", textItems.length);
-            console.log("Selections:", textSelections.length);
-            console.log("Redactions:", textRedactions.length);
-            console.groupEnd();
+      if (import.meta.env.DEV) {
+        console.log("[TEXT_DRAG_RECT_DEBUG]", {
+          dragStart: drag.start,
+          dragCurrent: current,
+          selectionRect: selectionViewportRect,
+          viewportScale: activeViewport.scale,
+          pageNumber,
+        });
+      }
 
-            logTextSelectionRectDebug(
-              activeViewport,
-              textSelections,
-              textRedactions,
-              pageNumber,
-            );
-          }
+      const requestRect = viewportRectToPdfRect(activeViewport, selectionViewportRect);
+      let snappedPayload = null;
 
-          if (textRedactions.length > 0) {
-            onAddRedactions(textRedactions);
-          }
+      try {
+        snappedPayload = await snapTextRedactions({
+          fileId,
+          page: pageNumber,
+          rect: requestRect,
+          mode: "char",
+          expandToWord: false,
+          excludeDotLeader: true,
+          excludePageNumber: true,
+        });
+      } catch (snapError) {
+        if (import.meta.env.DEV) {
+          console.warn("[SNAP_TEXT_DEBUG] request failed", snapError);
         }
+      }
+
+      const snappedRedactions = Array.isArray(snappedPayload?.redactions)
+        ? snappedPayload.redactions
+          .map((item) => {
+            const rawRect = item?.rect;
+            if (
+              !rawRect
+              || !Number.isFinite(rawRect.x0)
+              || !Number.isFinite(rawRect.y0)
+              || !Number.isFinite(rawRect.x1)
+              || !Number.isFinite(rawRect.y1)
+            ) {
+              return null;
+            }
+
+            return {
+              id: makeId(),
+              page: Number.isFinite(item.page) ? item.page : pageNumber,
+              type: item?.type === MARKING_MODE_AREA ? MARKING_MODE_AREA : MARKING_MODE_TEXT,
+              rect: normalizeRect({
+                x0: rawRect.x0,
+                y0: rawRect.y0,
+                x1: rawRect.x1,
+                y1: rawRect.y1,
+              }),
+            };
+          })
+          .filter(Boolean)
+        : [];
+
+      if (import.meta.env.DEV) {
+        console.log("[SNAP_TEXT_DEBUG]", {
+          pageNumber,
+          requestRect,
+          snappedCount: snappedRedactions.length,
+          matchedWordCount: snappedPayload?.matchedWordCount ?? 0,
+        });
+      }
+
+      if (snappedRedactions.length > 0) {
+        onAddRedactions(snappedRedactions);
       }
 
       window.getSelection()?.removeAllRanges();
@@ -1480,7 +2332,7 @@ const PdfPage = React.memo(function PdfPage({
 
     setDrag(null);
     setTextSelectionPreviewRects([]);
-  }, [activeViewport, drag, editDrag, getLocalPoint, onAddRedaction, onAddRedactions, pageNumber]);
+  }, [activeViewport, drag, editDrag, fileId, getLocalPoint, onAddRedaction, onAddRedactions, pageNumber]);
 
   const visibleRedactions = useMemo(() => (
     activeViewport
@@ -1517,7 +2369,11 @@ const PdfPage = React.memo(function PdfPage({
   const stageClassName = [
     "page-stage",
     markingMode === MARKING_MODE_TEXT ? "is-text-mode" : "is-area-mode",
+    import.meta.env.DEV && ENABLE_TEXT_LAYER_VISUAL_DEBUG ? "is-text-layer-content-debug" : "",
   ].filter(Boolean).join(" ");
+  const shouldRenderVisualDebug = import.meta.env.DEV
+    && ENABLE_TEXT_LAYER_VISUAL_DEBUG
+    && ENABLE_TEXT_LAYER_RECT_OVERLAY_DEBUG;
 
   return h(
     "section",
@@ -1548,11 +2404,59 @@ const PdfPage = React.memo(function PdfPage({
         },
       },
       h("canvas", { ref: canvasRef, className: "pdf-canvas" }),
+      h("div", { ref: textLayerRef, className: "text-layer", "aria-hidden": true }),
       textSelectionPreviewRects.map((rect, index) => h("div", {
         key: `text-selection-preview-${index}`,
         className: "text-selection-preview",
         style: toBoxStyle(rect),
       })),
+      shouldRenderVisualDebug ? h(
+        "div",
+        { className: "text-layer-visual-debug-overlay" },
+        textLayerVisualDebugRects.map((item) => h(
+          "div",
+          {
+            key: `text-layer-debug-${item.key}`,
+            className: `text-layer-visual-debug-rect${item.kind === "keyword" ? " is-keyword" : " is-line"}`,
+            style: toBoxStyle(item.rect),
+          },
+          (() => {
+            const isKeyword = item.kind === "keyword";
+            const isSelectionLine = isRectOnSelectionLine(item.rect, nativeSelectionVisualDebugRects);
+            if (!isKeyword && !isSelectionLine) {
+              return null;
+            }
+
+            const labelText = (item.text || "").trim().slice(0, 40);
+            if (!labelText) {
+              return null;
+            }
+
+            return h(
+              "span",
+              {
+                className: `text-layer-visual-debug-label${isKeyword ? " is-keyword" : " is-line"}`,
+              },
+              labelText,
+            );
+          })(),
+        )),
+        nativeSelectionVisualDebugRects.map((rect, index) => h("div", {
+          key: `text-layer-debug-selection-${index}`,
+          className: "text-layer-visual-debug-rect is-selection",
+          style: toBoxStyle(rect),
+        })),
+        textSelectionDisplayDebugRects.map((rect, index) => h("div", {
+          key: `text-layer-debug-display-${index}`,
+          className: "text-layer-visual-debug-rect is-display",
+          style: toBoxStyle(rect),
+        })),
+        textSelectionRedactionDebugRects.map((rect, index) => h("div", {
+          key: `text-layer-debug-redaction-${index}`,
+          className: "text-layer-visual-debug-rect is-redaction",
+          style: toBoxStyle(rect),
+        })),
+      ) : null,
       visibleRedactions.map((redaction) => {
         const isSelected = redaction.id === selectedRedactionId;
 
@@ -3415,6 +4319,7 @@ export default function App() {
               visiblePageNumbers.map((pageNumber) => h(PdfPage, {
                 key: pageNumber,
                 pdfDoc,
+                fileId,
                 pageInfo: pageInfoByPage.get(pageNumber),
                 pageNumber,
                 zoom: viewMode === "fit" ? fitZoom : renderZoom,
