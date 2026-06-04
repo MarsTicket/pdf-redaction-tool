@@ -1904,6 +1904,23 @@ function isEditableEventTarget(target) {
 }
 
 
+function isDeleteBlockedEventTarget(target) {
+  if (!target || typeof target !== "object") {
+    return false;
+  }
+
+  const tagName = typeof target.tagName === "string" ? target.tagName.toLowerCase() : "";
+  if (tagName === "input") {
+    const inputType = typeof target.type === "string" ? target.type.toLowerCase() : "";
+    return inputType !== "range" && inputType !== "button";
+  }
+
+  return tagName === "textarea"
+    || tagName === "select"
+    || Boolean(target.isContentEditable);
+}
+
+
 function resizeViewportRect(rect, handle, point, bounds, preserveRatio) {
   const normalized = normalizeRect(rect);
   const anchorX = handle.includes("w") ? normalized.x1 : normalized.x0;
@@ -3480,7 +3497,7 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (event) => {
-      if (event.ctrlKey || event.altKey || event.metaKey || isEditableEventTarget(event.target)) {
+      if (event.ctrlKey || event.altKey || event.metaKey || isDeleteBlockedEventTarget(event.target)) {
         return;
       }
 

@@ -59,7 +59,7 @@ if not exist "%FRONTEND_DIR%\node_modules" (
 )
 
 echo Starting backend on http://127.0.0.1:%BACKEND_PORT% ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=$env:PDF_TOOL_ROOT; $backendDir=Join-Path $root 'backend'; $tmpDir=Join-Path $root 'tmp'; $py=Join-Path $backendDir '.venv\Scripts\python.exe'; if (-not (Get-NetTCPConnection -LocalPort 8010 -State Listen -ErrorAction SilentlyContinue)) { $p=Start-Process -FilePath $py -ArgumentList @('-m','uvicorn','app:app','--reload','--host','127.0.0.1','--port','8010') -WorkingDirectory $backendDir -WindowStyle Hidden -RedirectStandardOutput (Join-Path $tmpDir 'backend-dev.log') -RedirectStandardError (Join-Path $tmpDir 'backend-dev.err.log') -PassThru; $p.Id | Set-Content -Encoding ascii (Join-Path $tmpDir 'backend.pid'); Write-Host ('Backend started: ' + $p.Id) } else { Write-Host 'Backend already running.' }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=$env:PDF_TOOL_ROOT; $backendDir=Join-Path $root 'backend'; $tmpDir=Join-Path $root 'tmp'; $py=Join-Path $backendDir '.venv\Scripts\python.exe'; if (-not (Get-NetTCPConnection -LocalPort 8010 -State Listen -ErrorAction SilentlyContinue)) { $p=Start-Process -FilePath $py -ArgumentList @('-m','uvicorn','app:app','--host','127.0.0.1','--port','8010') -WorkingDirectory $backendDir -WindowStyle Hidden -RedirectStandardOutput (Join-Path $tmpDir 'backend-dev.log') -RedirectStandardError (Join-Path $tmpDir 'backend-dev.err.log') -PassThru; $p.Id | Set-Content -Encoding ascii (Join-Path $tmpDir 'backend.pid'); Write-Host ('Backend started: ' + $p.Id) } else { Write-Host 'Backend already running.' }"
 if errorlevel 1 exit /b 1
 
 echo Starting frontend on http://127.0.0.1:%FRONTEND_PORT% ...

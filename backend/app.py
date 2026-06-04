@@ -169,6 +169,8 @@ def _write_json(path: Path, data: dict) -> None:
 
 AREA_TEXT_PROTECT_OVERLAP_RATIO = 0.18
 AREA_TEXT_PROTECT_GAP = 0.25
+TEXT_REDACTION_EDGE_PROTECT_OVERLAP_RATIO = 0.45
+TEXT_REDACTION_EDGE_PROTECT_GAP = 0.25
 DOT_LEADER_PATTERN = re.compile(r"^[.\u00b7\u2022\u2027\u2219\u30fb\u318d\u2026\u2027\u30fb\-_]{3,}$")
 DOT_LEADER_SEQUENCE_PATTERN = re.compile(r"[.\u00b7\u2022\u2027\u2219\u30fb\u318d\u2026\u2027\u30fb\-_]{3,}")
 PAGE_NUMBER_PATTERN = re.compile(r"^\d{1,4}$")
@@ -208,6 +210,40 @@ def _protect_area_rect_from_grazed_text(page: fitz.Page, rect: fitz.Rect) -> fit
             adjusted.y0 = max(adjusted.y0, word_rect.y1 + AREA_TEXT_PROTECT_GAP)
         elif center_y > adjusted.y1:
             adjusted.y1 = min(adjusted.y1, word_rect.y0 - AREA_TEXT_PROTECT_GAP)
+
+        if adjusted.is_empty or adjusted.width <= 0.5 or adjusted.height <= 0.5:
+            return fitz.Rect(rect)
+
+    return adjusted
+
+
+def _protect_text_rect_from_grazed_chars(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
+    """Trim text redactions away from adjacent glyphs that only graze the edge."""
+    adjusted = fitz.Rect(rect)
+
+    for _char_text, char_rect in _get_page_raw_chars(page):
+        intersection = adjusted & char_rect
+        char_area = char_rect.get_area()
+        if intersection.is_empty or char_area <= 0:
+            continue
+
+        overlap_ratio = intersection.get_area() / char_area
+        center_x = (char_rect.x0 + char_rect.x1) / 2
+        center_y = (char_rect.y0 + char_rect.y1) / 2
+        if (
+            overlap_ratio >= TEXT_REDACTION_EDGE_PROTECT_OVERLAP_RATIO
+            or _is_point_inside_rect(adjusted, center_x, center_y)
+        ):
+            continue
+
+        if center_x < adjusted.x0:
+            adjusted.x0 = max(adjusted.x0, char_rect.x1 + TEXT_REDACTION_EDGE_PROTECT_GAP)
+        elif center_x > adjusted.x1:
+            adjusted.x1 = min(adjusted.x1, char_rect.x0 - TEXT_REDACTION_EDGE_PROTECT_GAP)
+        elif center_y < adjusted.y0:
+            adjusted.y0 = max(adjusted.y0, char_rect.y1 + TEXT_REDACTION_EDGE_PROTECT_GAP)
+        elif center_y > adjusted.y1:
+            adjusted.y1 = min(adjusted.y1, char_rect.y0 - TEXT_REDACTION_EDGE_PROTECT_GAP)
 
         if adjusted.is_empty or adjusted.width <= 0.5 or adjusted.height <= 0.5:
             return fitz.Rect(rect)
@@ -665,6 +701,8 @@ async def redact_pdf(payload: RedactRequest) -> RedactResponse:
             )
             if item.type == "area":
                 rect = _protect_area_rect_from_grazed_text(page, rect)
+            elif item.type == "text":
+                rect = _protect_text_rect_from_grazed_chars(page, rect)
             if rect.is_empty or rect.get_area() <= 0:
                 raise HTTPException(status_code=400, detail=f"Invalid redaction rectangle on page {item.page}")
 
