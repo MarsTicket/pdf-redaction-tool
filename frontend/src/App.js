@@ -3021,6 +3021,18 @@ export default function App() {
 
   const lastWheelTimeRef = useRef(0);
 
+  const resetSearchState = useCallback((clearInput = true) => {
+    if (clearInput) {
+      setSearchInput("");
+    }
+
+    setSearchTerm("");
+    setSearchResults([]);
+    setActiveSearchIndex(-1);
+    setSearchStatus("idle");
+    setIsSearchPanelOpen(false);
+  }, []);
+
   useEffect(() => {
     return () => {
       if (objectUrlRef.current) {
@@ -4023,7 +4035,7 @@ export default function App() {
     if (!query) {
       setNotice("");
       setError(TEXT.searchEmpty);
-      setIsSearchPanelOpen(false);
+      resetSearchState(false);
       return;
     }
 
@@ -4090,7 +4102,7 @@ export default function App() {
       setIsSearchPanelOpen(false);
       setError(TEXT.searchNoResults);
     }
-  }, [pageInfoByPage, pdfDoc, renderZoom, scrollToPage, searchInput]);
+  }, [pageInfoByPage, pdfDoc, renderZoom, resetSearchState, scrollToPage, searchInput]);
 
   const handleSearchKeyDown = useCallback((event) => {
     if (event.key === "Enter") {
@@ -4295,13 +4307,14 @@ export default function App() {
             value: searchInput,
             placeholder: TEXT.searchPlaceholder,
             onChange: (event) => {
-              setSearchInput(event.target.value);
-              if (!event.target.value.trim()) {
-                setIsSearchPanelOpen(false);
+              const nextValue = event.target.value;
+              setSearchInput(nextValue);
+              if (!nextValue.trim()) {
+                resetSearchState(false);
               }
             },
             onFocus: () => {
-              if (searchTerm) {
+              if (searchInput.trim() && searchTerm) {
                 setIsSearchPanelOpen(true);
               }
             },
@@ -4349,7 +4362,7 @@ export default function App() {
             h(SearchNextIcon),
           ),
         ),
-        isSearchPanelOpen && searchTerm ? h(
+        isSearchPanelOpen && searchInput.trim() && searchTerm ? h(
           "div",
           { className: "header-search-panel" },
           h("p", { className: "muted" }, `${TEXT.searchResults}: ${searchResults.length}`),
